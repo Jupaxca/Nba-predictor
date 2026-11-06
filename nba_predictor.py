@@ -75,14 +75,17 @@ def obtener_log_jugador(nombre, temporadas, incluir_playoffs=True):
     for temp in temporadas:
         for tipo in tipos:
             clave = f"jug_{pid}_{temp}_{tipo.replace(' ', '')}"
-            df = _con_cache(clave, lambda t=temp, ty=tipo: playergamelog.PlayerGameLog(
-                player_id=pid, season=t, season_type_all_star=ty, timeout=20).get_data_frames()[0])
-            if df is not None and not df.empty:
-                df = df.copy()
-                df["ES_PLAYOFF"] = int(tipo == "Playoffs")
-                partes.append(df)
+            try:
+                df = _con_cache(clave, lambda t=temp, ty=tipo: playergamelog.PlayerGameLog(
+                    player_id=pid, season=t, season_type_all_star=ty, timeout=25).get_data_frames()[0])
+                if df is not None and not df.empty:
+                    df = df.copy()
+                    df["ES_PLAYOFF"] = int(tipo == "Playoffs")
+                    partes.append(df)
+            except Exception:
+                continue
     if not partes:
-        raise ValueError("Sin datos para las temporadas indicadas")
+        raise ValueError(f"No se pudieron cargar partidos recientes para {nombre}")
     df = pd.concat(partes, ignore_index=True)
     df = df.rename(columns={"Game_ID": "GAME_ID"})
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
@@ -98,10 +101,15 @@ def obtener_logs_equipos(temporadas, incluir_playoffs=True):
     for temp in temporadas:
         for tipo in tipos:
             clave = f"equipos_{temp}_{tipo.replace(' ', '')}"
-            df = _con_cache(clave, lambda t=temp, ty=tipo: leaguegamelog.LeagueGameLog(
-                season=t, player_or_team_abbreviation="T", season_type_all_star=ty, timeout=20).get_data_frames()[0])
-            if df is not None and not df.empty:
-                partes.append(df.copy())
+            try:
+                df = _con_cache(clave, lambda t=temp, ty=tipo: leaguegamelog.LeagueGameLog(
+                    season=t, player_or_team_abbreviation="T", season_type_all_star=ty, timeout=20).get_data_frames()[0])
+                if df is not None and not df.empty:
+                    partes.append(df.copy())
+            except Exception:
+                continue
+    if not partes:
+        raise ValueError("No se pudieron cargar los registros de equipos")
     eq = pd.concat(partes, ignore_index=True)
     eq["GAME_DATE"] = pd.to_datetime(eq["GAME_DATE"])
     return eq
@@ -291,7 +299,6 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     x2_next = x_next.copy()
     x2_next["MIN_PRED"] = min_pred
 
-    # Hiperparametros pre-optimizados ultrarrapidos por tipo de metrica
     obj_xgb = "count:poisson" if metrica in ["AST", "REB", "STL", "BLK"] else "reg:tweedie"
     
     m_xgb = XGBRegressor(
@@ -320,7 +327,6 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     oof_ens = A @ pesos
     residuos = y.to_numpy() - oof_ens
     
-    # Monte Carlo ultrarrapido vectorizado
     sim = np.maximum(0, np.round(mu + rng.choice(residuos, size=5000, replace=True)))
     p_boot = float(np.mean(sim > linea))
     
