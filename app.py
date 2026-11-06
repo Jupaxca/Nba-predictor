@@ -123,7 +123,7 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------
-# FUNCIONES AUXILIARES DE BÚSQUEDA INTERACTIVA
+# FUNCIONES AUXILIARES DE BÚSQUEDA INTERACTIVA EN CASCADA
 # ---------------------------------------------------------------------
 @st.cache_data(ttl=86400)
 def obtener_diccionario_equipos():
@@ -133,11 +133,15 @@ def obtener_diccionario_equipos():
 
 @st.cache_data(ttl=86400)
 def obtener_plantilla_equipo(team_id):
-    try:
-        roster = commonteamroster.CommonTeamRoster(team_id=team_id).get_data_frames()[0]
-        return sorted(roster['PLAYER'].tolist())
-    except Exception:
-        return []
+    temporadas = ["2026-27", "2025-26"]
+    for temp in temporadas:
+        try:
+            roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=temp, timeout=15).get_data_frames()[0]
+            if not roster.empty and 'PLAYER' in roster.columns:
+                return sorted(roster['PLAYER'].unique().tolist())
+        except Exception:
+            continue
+    return []
 
 equipos_dict = obtener_diccionario_equipos()
 nombres_equipos = list(equipos_dict.keys())
@@ -150,7 +154,7 @@ st.markdown(
     <div class="hero-box">
         <div class="hero-title">NBAMetrics Pro</div>
         <p style="font-size: 14px; color: #94a3b8; margin-top: 6px; margin-bottom: 0;">
-            Búsqueda interactiva de plantillas y motor cuantitativo de predicción
+            Búsqueda interactiva en cascada y motor cuantitativo de predicción NBA
         </p>
     </div>
     """,
@@ -158,7 +162,7 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------
-# PANEL DE PARÁMETROS EN CASCADA (INTERACTIVO)
+# PANEL DE PARÁMETROS EN CASCADA
 # ---------------------------------------------------------------------
 st.markdown('<div class="nba-card">', unsafe_allow_html=True)
 st.subheader(" Seleccionar Partido y Jugador")
@@ -174,7 +178,7 @@ with col1:
     
     if plantilla:
         idx_lebron = plantilla.index("LeBron James") if "LeBron James" in plantilla else 0
-        jugador = st.selectbox("2. Jugador a analizar", plantilla, index=idx_lebron)
+        jugador = st.selectbox("2. Jugador a analizar", plantilla, index=idx_lebron, key=f"sel_jugador_{team_id}")
     else:
         jugador = st.text_input("2. Nombre del jugador", value="LeBron James")
 
@@ -191,7 +195,6 @@ with col3:
     local = st.checkbox("Juega de Local", value=True)
     playoffs = st.checkbox("Es Partido de Playoffs", value=False)
 
-# Lista de compañeros disponibles excluyendo al jugador seleccionado
 companeros_disponibles = [p for p in plantilla if p != jugador] if plantilla else []
 
 with st.expander(" Parámetros Avanzados (Opciones de Mercado y Ausencias)"):
@@ -206,7 +209,8 @@ with st.expander(" Parámetros Avanzados (Opciones de Mercado y Ausencias)"):
         ausentes = st.multiselect(
             "Compañeros ausentes hoy",
             options=companeros_disponibles,
-            default=[]
+            default=[],
+            key=f"ausentes_{team_id}_{jugador}"
         )
 
 ejecutar = st.button("Ejecutar Modelo Predictivo", type="primary", use_container_width=True)
@@ -218,7 +222,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 if ejecutar:
     try:
         with st.spinner(f"Cargando historial de {jugador} vs {rival_abrev} ({equipo_rival_nombre})..."):
-            datos = cargar_datos(jugador, ["2024-25", "2025-26"], incluir_playoffs=playoffs)
+            datos = cargar_datos(jugador, ["2025-26", "2026-27"], incluir_playoffs=playoffs)
             
             res = analizar(
                 datos=datos,
