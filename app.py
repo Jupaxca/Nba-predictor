@@ -1,7 +1,7 @@
 import streamlit as st
+import pandas as pd
 import json
 from nba_api.stats.static import teams, players
-from nba_api.stats.endpoints import commonteamroster
 from nba_predictor import cargar_datos, analizar
 
 st.set_page_config(
@@ -11,6 +11,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ---------------------------------------------------------------------
+# ESTILO VISUAL NBA
+# ---------------------------------------------------------------------
 st.markdown(
     """
 <style>
@@ -28,7 +31,7 @@ st.markdown(
     .block-container {
         padding-top: 1.5rem;
         padding-bottom: 2rem;
-        max-width: 1200px;
+        max-width: 1250px;
     }
 
     .hero-box {
@@ -85,13 +88,13 @@ st.markdown(
 
     [data-testid="stMetricValue"] {
         font-family: 'Oswald', sans-serif;
-        font-size: 2rem;
+        font-size: 1.8rem;
         font-weight: 700;
         color: #f8fafc;
     }
     [data-testid="stMetricLabel"] {
         color: #94a3b8;
-        font-size: 0.88rem;
+        font-size: 0.85rem;
     }
 
     .stButton button[kind="primary"] {
@@ -119,160 +122,169 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-HEADERS_NBA = {
-    'Host': 'stats.nba.com',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Referer': 'https://www.nba.com/'
-}
-
+# ---------------------------------------------------------------------
+# FUNCIONES AUXILIARES DE DATOS Y JUGADORES
+# ---------------------------------------------------------------------
 @st.cache_data(ttl=86400)
 def obtener_diccionario_equipos():
     lista = teams.get_teams()
     lista_ordenada = sorted(lista, key=lambda x: x['full_name'])
     return {t['full_name']: {'abbrev': t['abbreviation'], 'id': t['id']} for t in lista_ordenada}
 
-@st.cache_data(ttl=3600)
-def obtener_plantilla_equipo(equipo_nombre, team_id):
-    temporadas_buscar = ["2026-27", "2025-26"]
-    for temp in temporadas_buscar:
-        try:
-            roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=temp, headers=HEADERS_NBA, timeout=8).get_data_frames()[0]
-            if not roster.empty and 'PLAYER' in roster.columns:
-                jugadores = sorted(roster['PLAYER'].unique().tolist())
-                if len(jugadores) > 0:
-                    return jugadores
-        except Exception:
-            continue
+@st.cache_data(ttl=86400)
+def obtener_todos_jugadores():
     try:
         activos = players.get_active_players()
-        return sorted([p['full_name'] for p in activos])
+        nombres = sorted([p['full_name'] for p in activos])
+        if nombres:
+            return nombres
     except Exception:
-        return ["LeBron James", "Anthony Davis", "Austin Reaves", "D'Angelo Russell", "Rui Hachimura"]
+        pass
+    return [
+        "LeBron James", "Luka Doncic", "Stephen Curry", "Giannis Antetokounmpo",
+        "Nikola Jokic", "Jayson Tatum", "Shai Gilgeous-Alexander", "Anthony Edwards",
+        "Kevin Durant", "Anthony Davis", "Kyrie Irving", "Donovan Mitchell"
+    ]
 
 equipos_dict = obtener_diccionario_equipos()
 nombres_equipos = list(equipos_dict.keys())
+todos_los_jugadores = obtener_todos_jugadores()
 
+# ---------------------------------------------------------------------
+# HEADER
+# ---------------------------------------------------------------------
 st.markdown(
     """
     <div class="hero-box">
         <div class="hero-title">NBAMetrics Pro</div>
         <p style="font-size: 14px; color: #94a3b8; margin-top: 6px; margin-bottom: 0;">
-            Búsqueda interactiva en cascada y motor cuantitativo de predicción NBA
+            Análisis cuantitativo integral de todas las estadísticas individuales por partido
         </p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------------
+# PANEL DE PARÁMETROS INTERACTIVO
+# ---------------------------------------------------------------------
 st.markdown('<div class="nba-card">', unsafe_allow_html=True)
-st.subheader(" Seleccionar Partido y Jugador")
+st.subheader(" Configuración del Partido y Jugador")
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    idx_lakers = nombres_equipos.index("Los Angeles Lakers") if "Los Angeles Lakers" in nombres_equipos else 0
-    equipo_jugador = st.selectbox("1. Equipo del Jugador", nombres_equipos, index=idx_lakers, key="sel_equipo_jugador")
-    
-    team_id = equipos_dict[equipo_jugador]['id']
-    plantilla = obtener_plantilla_equipo(equipo_jugador, team_id)
-    
+    idx_doncic = todos_los_jugadores.index("Luka Doncic") if "Luka Doncic" in todos_los_jugadores else 0
     jugador = st.selectbox(
-        "2. Jugador a analizar",
-        options=plantilla,
-        index=0,
-        key=f"sel_jugador_{equipo_jugador}"
+        "1. Seleccionar Jugador (Todos los activos)",
+        options=todos_los_jugadores,
+        index=idx_doncic,
+        key="sel_jugador_global"
     )
 
 with col2:
-    rivales_disponibles = [eq for eq in nombres_equipos if eq != equipo_jugador]
-    idx_gsw = rivales_disponibles.index("Golden State Warriors") if "Golden State Warriors" in rivales_disponibles else 0
-    equipo_rival_nombre = st.selectbox("3. Equipo Rival", rivales_disponibles, index=idx_gsw, key="sel_equipo_rival")
-    
+    idx_gsw = nombres_equipos.index("Golden State Warriors") if "Golden State Warriors" in nombres_equipos else 0
+    equipo_rival_nombre = st.selectbox("2. Equipo Rival", nombres_equipos, index=idx_gsw, key="sel_equipo_rival")
     rival_abrev = equipos_dict[equipo_rival_nombre]['abbrev']
-    metrica = st.selectbox("Métrica a evaluar", ["PTS", "REB", "AST", "PRA", "PR", "PA", "RA", "FG3M", "STL", "BLK"])
 
 with col3:
-    linea = st.number_input("Línea de la apuesta", value=24.5, step=0.5)
     local = st.checkbox("Juega de Local", value=True)
     playoffs = st.checkbox("Es Partido de Playoffs", value=False)
 
-companeros_disponibles = [p for p in plantilla if p != jugador]
-
-with st.expander(" Parámetros Avanzados (Opciones de Mercado y Ausencias)", expanded=True):
+with st.expander(" Parámetros Avanzados (Handicap, Minutos y Bajas)", expanded=False):
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         spread = st.number_input("Handicap / Spread (Favorito -4.5)", value=0.0, step=0.5)
         minutos_override = st.number_input("Minutos Proyectados (0 = Automático)", value=0.0, step=1.0)
     with col_b:
-        cuota_over = st.number_input("Cuota Over (Decimal)", value=1.90, step=0.05)
-        cuota_under = st.number_input("Cuota Under (Decimal)", value=1.90, step=0.05)
-    with col_c:
-        ausentes = st.multiselect(
-            "Compañeros ausentes hoy",
-            options=companeros_disponibles,
-            default=[],
-            key=f"ausentes_{equipo_jugador}_{jugador}"
-        )
+        ausentes_txt = st.text_input("Compañeros ausentes hoy (Separados por coma)", value="")
+        ausentes = [x.strip() for x in ausentes_txt.split(",") if x.strip()]
 
-ejecutar = st.button("Ejecutar Modelo Predictivo", type="primary", use_container_width=True)
+ejecutar = st.button("Analizar Todas las Estadísticas", type="primary", use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
+# ---------------------------------------------------------------------
+# ANÁLISIS MULTIMÉTRICO COMPLETO
+# ---------------------------------------------------------------------
 if ejecutar:
     try:
-        with st.spinner(f"Cargando historial en vivo de {jugador} vs {rival_abrev} ({equipo_rival_nombre})..."):
+        with st.spinner(f"Descargando datos e investigando todas las estadísticas de {jugador} vs {rival_abrev}..."):
             datos = cargar_datos(jugador, ["2025-26", "2026-27"], incluir_playoffs=playoffs)
             
-            res = analizar(
-                datos=datos,
-                metrica=metrica,
-                linea=linea,
-                rival=rival_abrev,
-                local=local,
-                playoffs=playoffs,
-                companeros_fuera_hoy=ausentes,
-                minutos_override=minutos_override if minutos_override > 0 else None,
-                spread=spread if spread != 0.0 else None,
-                cuota_over=cuota_over if cuota_over > 0 else None,
-                cuota_under=cuota_under if cuota_under > 0 else None
-            )
+            metricas_lista = [
+                ("PTS", "Puntos", 24.5),
+                ("REB", "Rebotes", 7.5),
+                ("AST", "Asistencias", 7.5),
+                ("PRA", "Puntos + Rebotes + Asistencias", 39.5),
+                ("PR", "Puntos + Rebotes", 31.5),
+                ("PA", "Puntos + Asistencias", 31.5),
+                ("RA", "Rebotes + Asistencias", 14.5),
+                ("FG3M", "Triples Anotados", 2.5),
+                ("STL", "Robos", 1.5),
+                ("BLK", "Tapones", 0.5)
+            ]
+            
+            resultados = []
+            
+            for codigo_m, nombre_m, linea_def in metricas_lista:
+                res = analizar(
+                    datos=datos,
+                    metrica=codigo_m,
+                    linea=linea_def,
+                    rival=rival_abrev,
+                    local=local,
+                    playoffs=playoffs,
+                    companeros_fuera_hoy=ausentes,
+                    minutos_override=minutos_override if minutos_override > 0 else None,
+                    spread=spread if spread != 0.0 else None
+                )
+                res["nombre_largo"] = nombre_m
+                resultados.append(res)
 
         st.markdown('<div class="nba-card">', unsafe_allow_html=True)
         
         st.markdown(
             f"""
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-                <h3 style="margin: 0;">Reporte: {res['jugador']} ({equipos_dict[equipo_jugador]['abbrev']})</h3>
-                <span class="pill-badge pill-blue">{metrica} Línea: {linea} vs {equipo_rival_nombre} ({rival_abrev})</span>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3 style="margin: 0;">Reporte Integral: {jugador} vs {equipo_rival_nombre} ({rival_abrev})</h3>
+                <span class="pill-badge pill-blue">Minutos proyectados: {resultados[0]['minutos_proyectados']} min</span>
             </div>
             """,
             unsafe_allow_html=True
         )
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Proyección Modelo", f"{res['proyeccion_modelo']} {metrica}")
-        m2.metric("Minutos Esperados", f"{res['minutos_proyectados']} min")
-        m3.metric("Probabilidad Over", f"{res['probabilidad_over'] * 100:.1f}%")
-        
-        if "analisis_apuesta" in res:
-            ap = res["analisis_apuesta"]
-            m4.metric("Recomendación", ap["recomendacion"], delta=f"EV: {ap['EV'] * 100:.1f}%")
+        tabla_resumen = []
+        for r in resultados:
+            tabla_resumen.append({
+                "Estadística": r["nombre_largo"],
+                "Código": r["metrica"],
+                "Proyección": r["proyeccion_modelo"],
+                "Piso (P15)": r["escenarios"]["mal_juego_P15"],
+                "Techo (P85)": r["escenarios"]["techo_P85"]
+            })
+            
+        df_tabla = pd.DataFrame(tabla_resumen)
+        st.dataframe(df_tabla, use_container_width=True, hide_index=True)
 
         st.divider()
+        st.subheader(" Desglose Detallado por Categoría")
 
-        st.subheader(" Escenarios Simulados (Monte Carlo 15,000 iteraciones)")
-        e1, e2 = st.columns(2)
-        with e1:
-            st.info(f"Piso Estadístico (Percentil 15 - Juego Duro): **{res['escenarios']['mal_juego_P15']} {metrica}**")
-        with e2:
-            st.success(f"Techo Estadístico (Percentil 85 - En Racha): **{res['escenarios']['techo_P85']} {metrica}**")
+        cols = st.columns(3)
+        for idx, r in enumerate(resultados):
+            with cols[idx % 3]:
+                st.markdown(
+                    f"""
+                    <div style="background-color: #070a12; border: 1px solid #1e293b; border-radius: 10px; padding: 14px; margin-bottom: 14px;">
+                        <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">{r['nombre_largo']} ({r['metrica']})</div>
+                        <div style="font-family: 'Oswald', sans-serif; font-size: 2.2rem; font-weight: 700; color: #f8fafc; margin: 4px 0;">{r['proyeccion_modelo']}</div>
+                        <div style="font-size: 0.8rem; color: #64748b;">Rango estocástico: {r['escenarios']['mal_juego_P15']} a {r['escenarios']['techo_P85']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
-        st.subheader(" Ponderación de Modelos (NNLS Meta-Ensamble)")
-        st.json(res["pesos_ensamble"])
-
-        with st.expander(" Ver Estructura Completa de Datos (JSON)"):
-            st.json(res)
+        with st.expander(" Ver Estructura Completa de Datos de la Última Métrica (JSON)"):
+            st.json(resultados[0])
 
         st.markdown("</div>", unsafe_allow_html=True)
 
