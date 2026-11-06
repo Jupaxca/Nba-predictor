@@ -120,22 +120,33 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------
-# DATOS GLOBALES
+# CACHÉ RÁPIDA DE EQUIPOS Y JUGADORES ACTIVOS
 # ---------------------------------------------------------------------
-@st.cache_data
+@st.cache_data(ttl=86400)
 def obtener_diccionario_equipos():
     lista = teams.get_teams()
     lista_ordenada = sorted(lista, key=lambda x: x['full_name'])
     return {t['full_name']: {'abbrev': t['abbreviation'], 'id': t['id']} for t in lista_ordenada}
 
-@st.cache_data
-def obtener_lista_completa_jugadores():
-    activos = players.get_active_players()
-    return sorted([p['full_name'] for p in activos])
+@st.cache_data(ttl=86400)
+def obtener_lista_activos():
+    try:
+        activos = players.get_active_players()
+        nombres = sorted([p['full_name'] for p in activos])
+        if nombres:
+            return nombres
+    except Exception:
+        pass
+    # Lista de respaldo inmediata si la API falla
+    return [
+        "LeBron James", "Luka Doncic", "Stephen Curry", "Giannis Antetokounmpo",
+        "Nikola Jokic", "Jayson Tatum", "Shai Gilgeous-Alexander", "Anthony Edwards",
+        "Kevin Durant", "Anthony Davis", "Kyrie Irving", "Donovan Mitchell", "Jalen Brunson"
+    ]
 
 equipos_dict = obtener_diccionario_equipos()
 nombres_equipos = list(equipos_dict.keys())
-lista_jugadores_global = obtener_lista_completa_jugadores()
+lista_jugadores = obtener_lista_activos()
 
 # ---------------------------------------------------------------------
 # HEADER
@@ -161,10 +172,10 @@ st.subheader(" Configuración del Partido y Mercado")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    idx_lebron = lista_jugadores_global.index("LeBron James") if "LeBron James" in lista_jugadores_global else 0
+    idx_lebron = lista_jugadores.index("LeBron James") if "LeBron James" in lista_jugadores else 0
     jugador = st.selectbox(
         "1. Jugador a analizar (Escribe para buscar)",
-        options=lista_jugadores_global,
+        options=lista_jugadores,
         index=idx_lebron,
         key="sel_jugador_global"
     )
@@ -178,7 +189,7 @@ with col3:
     local = st.checkbox("Juega de Local", value=True)
     playoffs = st.checkbox("Es Partido de Playoffs", value=False)
 
-with st.expander(" Parámetros Avanzados y Cuotas de Mercado (Opcional)", expanded=True):
+with st.expander(" Parámetros Avanzados y Cuotas de Mercado (Opcional)", expanded=False):
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         spread = st.number_input("Handicap / Spread (Favorito -4.5)", value=0.0, step=0.5)
@@ -196,8 +207,9 @@ st.markdown("</div>", unsafe_allow_html=True)
 # ---------------------------------------------------------------------
 if ejecutar:
     try:
-        with st.spinner(f"Analizando métricas e historial de {jugador} vs {rival_abrev}..."):
-            datos = cargar_datos(jugador, ["2025-26", "2026-27"], incluir_playoffs=playoffs)
+        with st.spinner(f"Descargando partidos recientes de la temporada 2026-27 para {jugador}..."):
+            # Descargamos los datos una sola vez para optimizar velocidad
+            datos = cargar_datos(jugador, ["2026-27"], incluir_playoffs=playoffs)
             
             metricas_lista = [
                 ("PTS", "Puntos", 24.5),
@@ -281,9 +293,6 @@ if ejecutar:
                     """,
                     unsafe_allow_html=True
                 )
-
-        with st.expander(" Ver Estructura Completa de Datos de la Última Métrica (JSON)"):
-            st.json(resultados[0])
 
         st.markdown("</div>", unsafe_allow_html=True)
 
