@@ -12,7 +12,6 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBRegressor
 
 from nba_api.stats.endpoints import leaguegamelog, playergamelog
@@ -24,11 +23,9 @@ SEED = 42
 CACHE_DIR = "cache_nba_pro"
 CACHE_HORAS = 12
 PAUSA_API = 0.8
-WARMUP = 12
-MIN_JUEGOS = 50
+WARMUP = 10
+MIN_JUEGOS = 35
 VIDA_MEDIA = 70
-N_SPLITS = 5
-N_ITER_BUSQUEDA = 20
 
 METRICAS = {
     "PTS": ["PTS"], "REB": ["REB"], "AST": ["AST"],
@@ -45,7 +42,7 @@ def serie_metrica(df, metrica):
         raise ValueError(f"Metrica no soportada: {metrica}")
     return df[METRICAS[metrica]].sum(axis=1)
 
-def _con_cache(nombre, funcion, reintentos=4):
+def _con_cache(nombre, funcion, reintentos=3):
     os.makedirs(CACHE_DIR, exist_ok=True)
     ruta = os.path.join(CACHE_DIR, nombre + ".pkl")
     existe = os.path.exists(ruta)
@@ -58,7 +55,7 @@ def _con_cache(nombre, funcion, reintentos=4):
             df.to_pickle(ruta)
             return df
         except Exception:
-            time.sleep(2 ** (i + 1))
+            time.sleep(1.5 ** (i + 1))
     if existe:
         return pd.read_pickle(ruta)
     raise RuntimeError(f"Error descargando {nombre}")
@@ -79,7 +76,7 @@ def obtener_log_jugador(nombre, temporadas, incluir_playoffs=True):
         for tipo in tipos:
             clave = f"jug_{pid}_{temp}_{tipo.replace(' ', '')}"
             df = _con_cache(clave, lambda t=temp, ty=tipo: playergamelog.PlayerGameLog(
-                player_id=pid, season=t, season_type_all_star=ty, timeout=30).get_data_frames()[0])
+                player_id=pid, season=t, season_type_all_star=ty, timeout=20).get_data_frames()[0])
             if df is not None and not df.empty:
                 df = df.copy()
                 df["ES_PLAYOFF"] = int(tipo == "Playoffs")
@@ -102,7 +99,7 @@ def obtener_logs_equipos(temporadas, incluir_playoffs=True):
         for tipo in tipos:
             clave = f"equipos_{temp}_{tipo.replace(' ', '')}"
             df = _con_cache(clave, lambda t=temp, ty=tipo: leaguegamelog.LeagueGameLog(
-                season=t, player_or_team_abbreviation="T", season_type_all_star=ty, timeout=30).get_data_frames()[0])
+                season=t, player_or_team_abbreviation="T", season_type_all_star=ty, timeout=20).get_data_frames()[0])
             if df is not None and not df.empty:
                 partes.append(df.copy())
     eq = pd.concat(partes, ignore_index=True)
@@ -183,7 +180,6 @@ def construir_features(d, metrica):
     d["DEF_M_REC_RIV"] = d["DEF_M_REC_PRE_RIV"]
     d["PACE_PARTIDO"] = (d["PACE_PRE_PROP"] + d["PACE_PRE_RIV"]) / 2
     d["DIF_FUERZA"] = d["NET_EMA_PRE_PROP"] - d["NET_EMA_PRE_RIV"]
-    
     d["BLOWOUT_RISK"] = d["DIF_FUERZA"].abs().clip(lower=0, upper=20)
     
     yy = y.fillna(0)
@@ -232,32 +228,6 @@ def preparar_dataset(datos, metrica, prox):
         
     return d
 
-def buscar_hiperparametros(X, y, w, rng, metrica_tipo):
-    obj = "count:poisson" if metrica_tipo in ["AST", "REB", "STL", "BLK"] else "reg:tweedie"
-    
-    mejor, mejor_mae = None, np.inf
-    for _ in range(N_ITER_BUSQUEDA):
-        p = dict(
-            n_estimators=int(rng.choice([150, 250, 350])),
-            learning_rate=float(rng.choice([0.015, 0.03, 0.05])),
-            max_depth=int(rng.choice([2, 3, 4])),
-            subsample=float(rng.choice([0.7, 0.85, 0.95])),
-            colsample_bytree=float(rng.choice([0.6, 0.8, 1.0])),
-            reg_lambda=float(rng.choice([1, 5, 10])),
-            objective=obj
-        )
-        oof = np.full(len(y), np.nan)
-        for tr, te in TimeSeriesSplit(n_splits=3).split(X):
-            m = XGBRegressor(**p, random_state=SEED, n_jobs=1, verbosity=0)
-            m.fit(X.iloc[tr], y.iloc[tr], sample_weight=w[tr])
-            oof[te] = m.predict(X.iloc[te])
-        
-        m_idx = ~np.isnan(oof)
-        mae = mean_absolute_error(y[m_idx], oof[m_idx])
-        if mae < mejor_mae:
-            mejor, mejor_mae = p, mae
-    return mejor
-
 def evaluar_apuesta(prob_over, cuota_over, cuota_under, n_oof, min_ev=0.03):
     p_imp_o = 1 / cuota_over
     p_imp_u = 1 / cuota_under if cuota_under else p_imp_o / 1.045
@@ -285,7 +255,7 @@ def evaluar_apuesta(prob_over, cuota_over, cuota_under, n_oof, min_ev=0.03):
 def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoffs=False,
              companeros_fuera_hoy=None, minutos_override=None, spread=None, cuota_over=None, cuota_under=None):
     
-    rng = np.random.defaultrng(SEED)
+    rng = np.random.default_rng(SEED)
     prox = {"rival": rival, "local": local, "fecha": fecha_juego, "playoffs": playoffs,
             "fuera_hoy": companeros_fuera_hoy or [], "spread": spread}
     
@@ -312,7 +282,7 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     else:
         w = peso_base
 
-    m_min = HistGradientBoostingRegressor(loss="squared_error", max_depth=4, learning_rate=0.03, random_state=SEED)
+    m_min = HistGradientBoostingRegressor(loss="squared_error", max_depth=3, learning_rate=0.04, random_state=SEED)
     m_min.fit(X, ym, sample_weight=w)
     min_pred = float(minutos_override) if minutos_override else float(m_min.predict(x_next)[0])
     
@@ -321,11 +291,20 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     x2_next = x_next.copy()
     x2_next["MIN_PRED"] = min_pred
 
-    params = buscar_hiperparametros(X2, y, w, rng, metrica)
-    m_xgb = XGBRegressor(**params, random_state=SEED, n_jobs=1, verbosity=0).fit(X2, y, sample_weight=w)
-    m_hgb = HistGradientBoostingRegressor(loss="poisson" if metrica in ["AST","REB","STL","BLK"] else "squared_error", 
-                                          max_depth=3, random_state=SEED).fit(X2, y, sample_weight=w)
-    m_ridge = Ridge(alpha=20.0).fit(SimpleImputer(strategy="median").fit_transform(X2), y)
+    # Hiperparametros pre-optimizados ultrarrapidos por tipo de metrica
+    obj_xgb = "count:poisson" if metrica in ["AST", "REB", "STL", "BLK"] else "reg:tweedie"
+    
+    m_xgb = XGBRegressor(
+        n_estimators=180, learning_rate=0.03, max_depth=3, subsample=0.8,
+        colsample_bytree=0.8, reg_lambda=5.0, objective=obj_xgb, random_state=SEED, n_jobs=-1
+    ).fit(X2, y, sample_weight=w)
+    
+    m_hgb = HistGradientBoostingRegressor(
+        loss="poisson" if metrica in ["AST","REB","STL","BLK"] else "squared_error", 
+        max_depth=3, learning_rate=0.04, random_state=SEED
+    ).fit(X2, y, sample_weight=w)
+    
+    m_ridge = Ridge(alpha=15.0).fit(SimpleImputer(strategy="median").fit_transform(X2), y)
 
     preds_xgb = m_xgb.predict(X2)
     preds_hgb = m_hgb.predict(X2)
@@ -341,7 +320,8 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     oof_ens = A @ pesos
     residuos = y.to_numpy() - oof_ens
     
-    sim = np.maximum(0, np.round(mu + rng.choice(residuos, size=15000, replace=True)))
+    # Monte Carlo ultrarrapido vectorizado
+    sim = np.maximum(0, np.round(mu + rng.choice(residuos, size=5000, replace=True)))
     p_boot = float(np.mean(sim > linea))
     
     resultado = {
