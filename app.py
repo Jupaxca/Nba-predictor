@@ -11,9 +11,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ---------------------------------------------------------------------
-# ESTILO VISUAL NBA
-# ---------------------------------------------------------------------
 st.markdown(
     """
 <style>
@@ -112,7 +109,7 @@ st.markdown(
         box-shadow: 0 6px 18px rgba(225, 29, 72, 0.5);
     }
 
-    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"], .stMultiSelect div[data-baseweb="select"] {
+    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
         border-radius: 8px !important;
         background-color: #070a12 !important;
         border-color: #1e293b !important;
@@ -123,7 +120,7 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------
-# OBTENCIÓN LOCAL GARANTIZADA DE DATOS ESTÁTICOS
+# DATOS GLOBALES
 # ---------------------------------------------------------------------
 @st.cache_data
 def obtener_diccionario_equipos():
@@ -133,7 +130,6 @@ def obtener_diccionario_equipos():
 
 @st.cache_data
 def obtener_lista_completa_jugadores():
-    # Carga todos los jugadores activos registrados sin hacer peticiones web
     activos = players.get_active_players()
     return sorted([p['full_name'] for p in activos])
 
@@ -160,7 +156,7 @@ st.markdown(
 # PANEL DE CONFIGURACIÓN
 # ---------------------------------------------------------------------
 st.markdown('<div class="nba-card">', unsafe_allow_html=True)
-st.subheader(" Configuración del Partido")
+st.subheader(" Configuración del Partido y Mercado")
 
 col1, col2, col3 = st.columns(3)
 
@@ -182,23 +178,15 @@ with col3:
     local = st.checkbox("Juega de Local", value=True)
     playoffs = st.checkbox("Es Partido de Playoffs", value=False)
 
-# Lista de ausentes basada en la lista global descartando al seleccionado
-companeros_ausentes_disponibles = [p for p in lista_jugadores_global if p != jugador]
-
-with st.expander(" Parámetros Avanzados (Minutos, Handicap y Bajas)", expanded=True):
+with st.expander(" Parámetros Avanzados y Cuotas de Mercado (Opcional)", expanded=True):
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         spread = st.number_input("Handicap / Spread (Favorito -4.5)", value=0.0, step=0.5)
         minutos_override = st.number_input("Minutos Proyectados (0 = Automático)", value=0.0, step=1.0)
     with col_b:
-        st.write("")
+        cuota_over = st.number_input("Cuota Over Decimal (Ej. 1.90)", value=0.0, step=0.05)
     with col_c:
-        ausentes = st.multiselect(
-            "Compañeros ausentes hoy (Escribe para buscar)",
-            options=companeros_ausentes_disponibles,
-            default=[],
-            key=f"ausentes_{jugador}"
-        )
+        cuota_under = st.number_input("Cuota Under Decimal (Ej. 1.90)", value=0.0, step=0.05)
 
 ejecutar = st.button("Analizar Todas las Estadísticas", type="primary", use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
@@ -234,9 +222,10 @@ if ejecutar:
                     rival=rival_abrev,
                     local=local,
                     playoffs=playoffs,
-                    companeros_fuera_hoy=ausentes,
                     minutos_override=minutos_override if minutos_override > 0 else None,
-                    spread=spread if spread != 0.0 else None
+                    spread=spread if spread != 0.0 else None,
+                    cuota_over=cuota_over if cuota_over > 0 else None,
+                    cuota_under=cuota_under if cuota_under > 0 else None
                 )
                 res["nombre_largo"] = nombre_m
                 resultados.append(res)
@@ -255,13 +244,16 @@ if ejecutar:
 
         tabla_resumen = []
         for r in resultados:
-            tabla_resumen.append({
+            fila = {
                 "Estadística": r["nombre_largo"],
                 "Código": r["metrica"],
                 "Proyección": r["proyeccion_modelo"],
                 "Piso (P15)": r["escenarios"]["mal_juego_P15"],
                 "Techo (P85)": r["escenarios"]["techo_P85"]
-            })
+            }
+            if "analisis_apuesta" in r:
+                fila["Recomendación"] = f"{r['analisis_apuesta']['lado']} (EV: {r['analisis_apuesta']['EV']*100:.1f}%)"
+            tabla_resumen.append(fila)
             
         df_tabla = pd.DataFrame(tabla_resumen)
         st.dataframe(df_tabla, use_container_width=True, hide_index=True)
@@ -272,12 +264,19 @@ if ejecutar:
         cols = st.columns(3)
         for idx, r in enumerate(resultados):
             with cols[idx % 3]:
+                extra_html = ""
+                if "analisis_apuesta" in r:
+                    ap = r["analisis_apuesta"]
+                    color_rec = "#34d399" if ap["recomendacion"] == "APOSTAR" else "#94a3b8"
+                    extra_html = f"<div style='font-size: 0.78rem; color: {color_rec}; margin-top: 4px;'>Apuesta: <b>{ap['lado']}</b> (EV: {ap['EV']*100:.1f}%)</div>"
+
                 st.markdown(
                     f"""
                     <div style="background-color: #070a12; border: 1px solid #1e293b; border-radius: 10px; padding: 14px; margin-bottom: 14px;">
                         <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">{r['nombre_largo']} ({r['metrica']})</div>
                         <div style="font-family: 'Oswald', sans-serif; font-size: 2.2rem; font-weight: 700; color: #f8fafc; margin: 4px 0;">{r['proyeccion_modelo']}</div>
                         <div style="font-size: 0.8rem; color: #64748b;">Rango estocástico: {r['escenarios']['mal_juego_P15']} a {r['escenarios']['techo_P85']}</div>
+                        {extra_html}
                     </div>
                     """,
                     unsafe_allow_html=True
