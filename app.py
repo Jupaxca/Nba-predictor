@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
+import json
 from nba_api.stats.static import teams
-from nba_api.stats.endpoints import leaguegamelog
+from nba_api.stats.endpoints import commonteamroster, leaguegamelog
 from nba_predictor import cargar_datos, analizar
 
 st.set_page_config(
@@ -133,46 +134,51 @@ def obtener_diccionario_equipos():
     lista_ordenada = sorted(lista, key=lambda x: x['full_name'])
     return {t['full_name']: {'abbrev': t['abbreviation'], 'id': t['id']} for t in lista_ordenada}
 
-@st.cache_data(ttl=7200)
-def obtener_mapa_plantillas_actuales():
+@st.cache_data(ttl=3600)
+def obtener_plantilla_actualizada(equipo_abrev, team_id):
+    # Método 1: Petición por bitácora de jugadores activos en 2026-27
     try:
         log_p = leaguegamelog.LeagueGameLog(
             season="2026-27",
             player_or_team_abbreviation="P",
             headers=HEADERS_NBA,
-            timeout=15
+            timeout=10
         ).get_data_frames()[0]
         if not log_p.empty:
-            mapa = log_p.groupby("TEAM_ABBREVIATION")["PLAYER_NAME"].unique().to_dict()
-            return {eq: sorted(list(jugs)) for eq, jugs in mapa.items()}
+            jugs = log_p[log_p["TEAM_ABBREVIATION"] == equipo_abrev]["PLAYER_NAME"].unique()
+            if len(jugs) > 0:
+                return sorted(list(jugs))
     except Exception:
         pass
-    
+
+    # Método 2: Roster directo del equipo
     try:
-        log_prev = leaguegamelog.LeagueGameLog(
-            season="2025-26",
-            player_or_team_abbreviation="P",
-            headers=HEADERS_NBA,
-            timeout=15
-        ).get_data_frames()[0]
-        if not log_prev.empty:
-            mapa = log_prev.groupby("TEAM_ABBREVIATION")["PLAYER_NAME"].unique().to_dict()
-            return {eq: sorted(list(jugs)) for eq, jugs in mapa.items()}
+        roster = commonteamroster.CommonTeamRoster(team_id=team_id, season="2026-27", headers=HEADERS_NBA, timeout=10).get_data_frames()[0]
+        if not roster.empty and 'PLAYER' in roster.columns:
+            jugs = sorted(roster['PLAYER'].unique().tolist())
+            if len(jugs) > 0:
+                return jugs
     except Exception:
         pass
-        
-    return {}
+
+    # Fallback predeterminado según franquicia
+    fallback_estatico = {
+        "LAL": ["LeBron James", "Anthony Davis", "Austin Reaves", "Rui Hachimura", "D'Angelo Russell", "Dalton Knecht", "Gabe Vincent"],
+        "GSW": ["Stephen Curry", "Draymond Green", "Jonathan Kuminga", "Brandin Podziemski", "Andrew Wiggins", "Buddy Hield"],
+        "BOS": ["Jayson Tatum", "Jaylen Brown", "Derrick White", "Jrue Holiday", "Kristaps Porzingis", "Al Horford"],
+        "DAL": ["Luka Doncic", "Kyrie Irving", "Klay Thompson", "P.J. Washington", "Daniel Gafford", "Dereck Lively II"]
+    }
+    return fallback_estatico.get(equipo_abrev, ["LeBron James", "Anthony Davis", "Stephen Curry", "Luka Doncic"])
 
 equipos_dict = obtener_diccionario_equipos()
 nombres_equipos = list(equipos_dict.keys())
-mapa_plantillas = obtener_mapa_plantillas_actuales()
 
 st.markdown(
     """
     <div class="hero-box">
         <div class="hero-title">NBAMetrics Pro</div>
         <p style="font-size: 14px; color: #94a3b8; margin-top: 6px; margin-bottom: 0;">
-            Análisis cuantitativo integral y búsqueda en cascada por plantilla actual 2026-27
+            Análisis cuantitativo integral con datos y plantillas actualizadas 2026-27
         </p>
     </div>
     """,
@@ -188,11 +194,9 @@ with col1:
     idx_lakers = nombres_equipos.index("Los Angeles Lakers") if "Los Angeles Lakers" in nombres_equipos else 0
     equipo_jugador = st.selectbox("1. Equipo del Jugador", nombres_equipos, index=idx_lakers, key="sel_equipo_jugador")
     
+    team_id = equipos_dict[equipo_jugador]['id']
     abrev_eq = equipos_dict[equipo_jugador]['abbrev']
-    plantilla = mapa_plantillas.get(abrev_eq, [])
-    
-    if not plantilla:
-        plantilla = ["LeBron James", "Anthony Davis", "Austin Reaves", "Rui Hachimura", "D'Angelo Russell"]
+    plantilla = obtener_plantilla_actualizada(abrev_eq, team_id)
     
     jugador = st.selectbox(
         "2. Jugador a analizar",
@@ -233,7 +237,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 if ejecutar:
     try:
-        with st.spinner(f"Descargando datos e investigando todas las estadísticas de {jugador} vs {rival_abrev}..."):
+        with st.spinner(f"Descargando historial 2026-27 de {jugador} vs {rival_abrev}..."):
             datos = cargar_datos(jugador, ["2025-26", "2026-27"], incluir_playoffs=playoffs)
             
             metricas_lista = [
