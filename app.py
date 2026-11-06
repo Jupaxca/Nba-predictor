@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
 import json
-from nba_api.stats.static import teams
-from nba_api.stats.endpoints import commonteamroster, leaguegamelog
+from nba_api.stats.static import teams, players
 from nba_predictor import cargar_datos, analizar
 
 st.set_page_config(
@@ -12,6 +11,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ---------------------------------------------------------------------
+# ESTILO VISUAL NBA
+# ---------------------------------------------------------------------
 st.markdown(
     """
 <style>
@@ -120,104 +122,70 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-HEADERS_NBA = {
-    'Host': 'stats.nba.com',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Referer': 'https://www.nba.com/'
-}
-
-@st.cache_data(ttl=86400)
+# ---------------------------------------------------------------------
+# OBTENCIÓN LOCAL GARANTIZADA DE DATOS ESTÁTICOS
+# ---------------------------------------------------------------------
+@st.cache_data
 def obtener_diccionario_equipos():
     lista = teams.get_teams()
     lista_ordenada = sorted(lista, key=lambda x: x['full_name'])
     return {t['full_name']: {'abbrev': t['abbreviation'], 'id': t['id']} for t in lista_ordenada}
 
-@st.cache_data(ttl=3600)
-def obtener_plantilla_actualizada(equipo_abrev, team_id):
-    # Método 1: Petición por bitácora de jugadores activos en 2026-27
-    try:
-        log_p = leaguegamelog.LeagueGameLog(
-            season="2026-27",
-            player_or_team_abbreviation="P",
-            headers=HEADERS_NBA,
-            timeout=10
-        ).get_data_frames()[0]
-        if not log_p.empty:
-            jugs = log_p[log_p["TEAM_ABBREVIATION"] == equipo_abrev]["PLAYER_NAME"].unique()
-            if len(jugs) > 0:
-                return sorted(list(jugs))
-    except Exception:
-        pass
-
-    # Método 2: Roster directo del equipo
-    try:
-        roster = commonteamroster.CommonTeamRoster(team_id=team_id, season="2026-27", headers=HEADERS_NBA, timeout=10).get_data_frames()[0]
-        if not roster.empty and 'PLAYER' in roster.columns:
-            jugs = sorted(roster['PLAYER'].unique().tolist())
-            if len(jugs) > 0:
-                return jugs
-    except Exception:
-        pass
-
-    # Fallback predeterminado según franquicia
-    fallback_estatico = {
-        "LAL": ["LeBron James", "Anthony Davis", "Austin Reaves", "Rui Hachimura", "D'Angelo Russell", "Dalton Knecht", "Gabe Vincent"],
-        "GSW": ["Stephen Curry", "Draymond Green", "Jonathan Kuminga", "Brandin Podziemski", "Andrew Wiggins", "Buddy Hield"],
-        "BOS": ["Jayson Tatum", "Jaylen Brown", "Derrick White", "Jrue Holiday", "Kristaps Porzingis", "Al Horford"],
-        "DAL": ["Luka Doncic", "Kyrie Irving", "Klay Thompson", "P.J. Washington", "Daniel Gafford", "Dereck Lively II"]
-    }
-    return fallback_estatico.get(equipo_abrev, ["LeBron James", "Anthony Davis", "Stephen Curry", "Luka Doncic"])
+@st.cache_data
+def obtener_lista_completa_jugadores():
+    # Carga todos los jugadores activos registrados sin hacer peticiones web
+    activos = players.get_active_players()
+    return sorted([p['full_name'] for p in activos])
 
 equipos_dict = obtener_diccionario_equipos()
 nombres_equipos = list(equipos_dict.keys())
+lista_jugadores_global = obtener_lista_completa_jugadores()
 
+# ---------------------------------------------------------------------
+# HEADER
+# ---------------------------------------------------------------------
 st.markdown(
     """
     <div class="hero-box">
         <div class="hero-title">NBAMetrics Pro</div>
         <p style="font-size: 14px; color: #94a3b8; margin-top: 6px; margin-bottom: 0;">
-            Análisis cuantitativo integral con datos y plantillas actualizadas 2026-27
+            Motor cuantitativo de proyección individual multimétrica
         </p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------------
+# PANEL DE CONFIGURACIÓN
+# ---------------------------------------------------------------------
 st.markdown('<div class="nba-card">', unsafe_allow_html=True)
-st.subheader(" Configuración del Partido y Jugador")
+st.subheader(" Configuración del Partido")
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    idx_lakers = nombres_equipos.index("Los Angeles Lakers") if "Los Angeles Lakers" in nombres_equipos else 0
-    equipo_jugador = st.selectbox("1. Equipo del Jugador", nombres_equipos, index=idx_lakers, key="sel_equipo_jugador")
-    
-    team_id = equipos_dict[equipo_jugador]['id']
-    abrev_eq = equipos_dict[equipo_jugador]['abbrev']
-    plantilla = obtener_plantilla_actualizada(abrev_eq, team_id)
-    
+    idx_lebron = lista_jugadores_global.index("LeBron James") if "LeBron James" in lista_jugadores_global else 0
     jugador = st.selectbox(
-        "2. Jugador a analizar",
-        options=plantilla,
-        index=0,
-        key=f"sel_jugador_{abrev_eq}"
+        "1. Jugador a analizar (Escribe para buscar)",
+        options=lista_jugadores_global,
+        index=idx_lebron,
+        key="sel_jugador_global"
     )
 
 with col2:
-    rivales_disponibles = [eq for eq in nombres_equipos if eq != equipo_jugador]
-    idx_gsw = rivales_disponibles.index("Golden State Warriors") if "Golden State Warriors" in rivales_disponibles else 0
-    equipo_rival_nombre = st.selectbox("3. Equipo Rival", rivales_disponibles, index=idx_gsw, key="sel_equipo_rival")
+    idx_gsw = nombres_equipos.index("Golden State Warriors") if "Golden State Warriors" in nombres_equipos else 0
+    equipo_rival_nombre = st.selectbox("2. Equipo Rival", nombres_equipos, index=idx_gsw, key="sel_equipo_rival")
     rival_abrev = equipos_dict[equipo_rival_nombre]['abbrev']
 
 with col3:
     local = st.checkbox("Juega de Local", value=True)
     playoffs = st.checkbox("Es Partido de Playoffs", value=False)
 
-companeros_disponibles = [p for p in plantilla if p != jugador]
+# Lista de ausentes basada en la lista global descartando al seleccionado
+companeros_ausentes_disponibles = [p for p in lista_jugadores_global if p != jugador]
 
-with st.expander(" Parámetros Avanzados (Handicap, Minutos y Bajas)", expanded=True):
+with st.expander(" Parámetros Avanzados (Minutos, Handicap y Bajas)", expanded=True):
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         spread = st.number_input("Handicap / Spread (Favorito -4.5)", value=0.0, step=0.5)
@@ -226,18 +194,21 @@ with st.expander(" Parámetros Avanzados (Handicap, Minutos y Bajas)", expanded=
         st.write("")
     with col_c:
         ausentes = st.multiselect(
-            "Compañeros ausentes hoy",
-            options=companeros_disponibles,
+            "Compañeros ausentes hoy (Escribe para buscar)",
+            options=companeros_ausentes_disponibles,
             default=[],
-            key=f"ausentes_{abrev_eq}_{jugador}"
+            key=f"ausentes_{jugador}"
         )
 
 ejecutar = st.button("Analizar Todas las Estadísticas", type="primary", use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
+# ---------------------------------------------------------------------
+# ANÁLISIS MULTIMÉTRICO COMPLETO
+# ---------------------------------------------------------------------
 if ejecutar:
     try:
-        with st.spinner(f"Descargando historial 2026-27 de {jugador} vs {rival_abrev}..."):
+        with st.spinner(f"Analizando métricas e historial de {jugador} vs {rival_abrev}..."):
             datos = cargar_datos(jugador, ["2025-26", "2026-27"], incluir_playoffs=playoffs)
             
             metricas_lista = [
@@ -275,7 +246,7 @@ if ejecutar:
         st.markdown(
             f"""
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                <h3 style="margin: 0;">Reporte Integral: {jugador} ({equipos_dict[equipo_jugador]['abbrev']}) vs {equipo_rival_nombre} ({rival_abrev})</h3>
+                <h3 style="margin: 0;">Reporte Integral: {jugador} vs {equipo_rival_nombre} ({rival_abrev})</h3>
                 <span class="pill-badge pill-blue">Minutos proyectados: {resultados[0]['minutos_proyectados']} min</span>
             </div>
             """,
