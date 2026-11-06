@@ -21,10 +21,10 @@ warnings.filterwarnings("ignore")
 
 SEED = 42
 CACHE_DIR = "cache_nba_pro"
-CACHE_HORAS = 12
+CACHE_HORAS = 6
 PAUSA_API = 0.5
-WARMUP = 10
-VIDA_MEDIA = 70
+WARMUP = 3 # Reducido para que los rookies con pocos partidos puedan correr
+VIDA_MEDIA = 40 # Mayor peso a los partidos recientes de la temporada actual
 
 METRICAS = {
     "PTS": ["PTS"], "REB": ["REB"], "AST": ["AST"],
@@ -65,12 +65,10 @@ def _id_jugador(nombre):
     busqueda = _quitar_acentos(nombre).lower().strip()
     todos = players.get_players()
     
-    # 1. Coincidencia exacta
     for p in todos:
         if _quitar_acentos(p["full_name"]).lower().strip() == busqueda:
             return p["id"]
             
-    # 2. Coincidencia parcial (por si acaso el apellido o nombre corto)
     for p in todos:
         if busqueda in _quitar_acentos(p["full_name"]).lower().strip():
             return p["id"]
@@ -82,7 +80,10 @@ def obtener_log_jugador(nombre, temporadas, incluir_playoffs=True):
     tipos = ["Regular Season"] + (["Playoffs"] if incluir_playoffs else [])
     partes = []
     
-    for temp in temporadas:
+    # PRIORIDAD 1: Buscar estrictamente en la temporada actual 2026-27
+    temporadas_ordenadas = ["2026-27"] + [t for t in temporadas if t != "2026-27"]
+    
+    for temp in temporadas_ordenadas:
         for tipo in tipos:
             clave = f"jug_{pid}_{temp}_{tipo.replace(' ', '')}"
             try:
@@ -100,7 +101,7 @@ def obtener_log_jugador(nombre, temporadas, incluir_playoffs=True):
                 continue
                 
     if not partes:
-        raise ValueError(f"No se pudieron cargar partidos recientes para {nombre}")
+        raise ValueError(f"El jugador {nombre} no registra partidos en la temporada actual 2026-27.")
         
     df = pd.concat(partes, ignore_index=True)
     df = df.rename(columns={"Game_ID": "GAME_ID"})
@@ -114,7 +115,7 @@ def obtener_log_jugador(nombre, temporadas, incluir_playoffs=True):
 def obtener_logs_equipos(temporadas, incluir_playoffs=True):
     tipos = ["Regular Season"] + (["Playoffs"] if incluir_playoffs else [])
     partes = []
-    for temp in temporadas:
+    for temp in ["2026-27"]:
         for tipo in tipos:
             clave = f"equipos_{temp}_{tipo.replace(' ', '')}"
             try:
@@ -128,7 +129,6 @@ def obtener_logs_equipos(temporadas, incluir_playoffs=True):
             except Exception:
                 continue
     if not partes:
-        # Fallback de seguridad si falla la liga completa
         return pd.DataFrame()
     eq = pd.concat(partes, ignore_index=True)
     eq["GAME_DATE"] = pd.to_datetime(eq["GAME_DATE"])
@@ -136,8 +136,7 @@ def obtener_logs_equipos(temporadas, incluir_playoffs=True):
 
 def construir_contexto_equipos(equipos, metrica):
     if equipos.empty:
-        # Retorna un DataFrame simulado vacío seguro para evitar quiebres
-        return pd.DataFrame(columns=["GAME_ID", "TEAM_ABBREVIATION", "DEF_M_POST", "PACE_POST", "NET_EMA_POST", "DIAS_DESC_EQ"])
+        return pd.DataFrame(columns=["GAME_ID", "TEAM_ABBREVIATION", "DEF_M_POST", "PACE_POST", "NET_EMA_POST"])
     
     t = equipos.copy()
     t["POSS"] = t["FGA"] + 0.44 * t["FTA"] - t["OREB"] + t["TOV"]
@@ -151,23 +150,20 @@ def construir_contexto_equipos(equipos, metrica):
     t["NET"] = t["PTS"] - t["PTS_OPP"]
     
     g = t.groupby("TEAM_ABBREVIATION")
-    t["DIas_DESC_EQ"] = g["GAME_DATE"].diff().dt.days
+    t["DIAS_DESC_EQ"] = g["GAME_DATE"].diff().dt.days
     
     for col, nom in [("M_PERMITIDO", "DEF_M"), ("PACE_J", "PACE"), ("NET", "NET_EMA"), ("PTS_OPP", "DEF_PTS")]:
-        post = g[col].transform(lambda s: s.ewm(span=10, adjust=False).mean())
-        post_corto = g[col].transform(lambda s: s.ewm(span=4, adjust=False).mean())
+        post = g[col].transform(lambda s: s.ewm(span=6, adjust=False).mean())
+        post_corto = g[col].transform(lambda s: s.ewm(span=3, adjust=False).mean())
         t[nom + "_POST"] = post
         t[nom + "_PRE"] = post.groupby(t["TEAM_ABBREVIATION"]).shift(1)
         t[nom + "_REC_PRE"] = post_corto.groupby(t["TEAM_ABBREVIATION"]).shift(1)
         
     return t
 
-def calcular_ausentes(log, companeros, temporadas, incluir_playoffs):
-    return np.zeros(len(log))
-
 def cargar_datos(nombre, temporadas, incluir_playoffs=True, companeros_clave=None):
-    log = obtener_log_jugador(nombre, temporadas, incluir_playoffs)
-    equipos = obtener_logs_equipos(temporadas, incluir_playoffs)
+    log = obtener_log_jugador(nombre, ["2026-27"], incluir_playoffs)
+    equipos = obtener_logs_equipos(["2026-27"], incluir_playoffs)
     log["N_AUSENTES"] = 0.0
     return {"nombre": nombre, "log": log, "equipos": equipos}
 
@@ -178,17 +174,17 @@ def construir_features(d, metrica):
     
     d["JUEGOS_7D"] = d.apply(lambda row: ((d["GAME_DATE"] >= row["GAME_DATE"] - pd.Timedelta(days=7)) & (d["GAME_DATE"] < row["GAME_DATE"])).sum(), axis=1)
 
-    for span in (3, 5, 10, 20):
+    for span in (2, 3, 5, 10):
         d[f"EMA_{span}"] = y.ewm(span=span, adjust=False).mean().shift(1)
     
-    d["VOL_5"] = y.rolling(5).std().shift(1).fillna(0)
-    d["TENDENCIA"] = d["EMA_5"] - d["EMA_20"]
+    d["VOL_5"] = y.rolling(3).std().shift(1).fillna(0)
+    d["TENDENCIA"] = d["EMA_3"] - d["EMA_10"]
     
     d["USG_PROXY"] = np.where(d["MIN"] > 0, (d["FGA"] + 0.44 * d["FTA"] + d["TOV"]) / d["MIN"], 0)
-    d["USG_EMA_5"] = d["USG_PROXY"].ewm(span=5, adjust=False).mean().shift(1)
+    d["USG_EMA_5"] = d["USG_PROXY"].ewm(span=3, adjust=False).mean().shift(1)
     
-    d["MIN_EMA_5"] = d["MIN"].ewm(span=5, adjust=False).mean().shift(1)
-    d["MIN_STD_5"] = d["MIN"].rolling(5).std().shift(1).fillna(0)
+    d["MIN_EMA_5"] = d["MIN"].ewm(span=3, adjust=False).mean().shift(1)
+    d["MIN_STD_5"] = d["MIN"].rolling(3).std().shift(1).fillna(0)
     
     d["DIAS_DESCANSO"] = 3
     d["DIAS_DESCANSO_RIV"] = 3
@@ -205,7 +201,7 @@ def construir_features(d, metrica):
     visto = y.notna().astype(int)
     suma = yy.groupby(d["RIVAL"]).cumsum() - yy
     n = visto.groupby(d["RIVAL"]).cumsum() - visto
-    d["HIST_RIVAL"] = (suma + 3 * d["EMA_20"]) / (n + 3)
+    d["HIST_RIVAL"] = (suma + 3 * d["EMA_5"]) / (n + 3)
 
     return d
 
@@ -222,7 +218,8 @@ def preparar_dataset(datos, metrica, prox):
         GAME_ID="PROX", GAME_DATE=fecha, EQUIPO=equipo, RIVAL=rival,
         MATCHUP=f"{equipo} {'vs.' if prox['local'] else '@'} {rival}",
         ES_LOCAL=int(prox["local"]), ES_PLAYOFF=int(prox["playoffs"]),
-        N_AUSENTES=0.0, MIN=32.0, FGA=15.0, FTA=5.0, TOV=3.0
+        N_AUSENTES=0.0, MIN=log["MIN"].iloc[-1] if not log.empty else 28.0,
+        FGA=12.0, FTA=4.0, TOV=2.0
     )
     
     log = pd.concat([log, pd.DataFrame([nueva])], ignore_index=True)
@@ -234,7 +231,7 @@ def evaluar_apuesta(prob_over, cuota_over, cuota_under, n_oof, min_ev=0.03):
     p_imp_u = 1 / cuota_under if cuota_under else p_imp_o / 1.045
     p_mkt_over = p_imp_o / (p_imp_o + p_imp_u)
     
-    w = min(n_oof / (n_oof + 80), 0.85)
+    w = min(n_oof / (n_oof + 40), 0.85)
     p_over = w * prob_over + (1 - w) * p_mkt_over
     p_under = 1 - p_over
     
@@ -248,7 +245,7 @@ def evaluar_apuesta(prob_over, cuota_over, cuota_under, n_oof, min_ev=0.03):
     mejor = max(res, key=lambda k: res[k]["ev"])
     return {
         "lado": mejor,
-        "EV": res[mejor]["ev"],
+        "EV": res[mejor]["EV"] if "EV" in res[mejor] else res[mejor]["ev"],
         "kelly": res[mejor]["kelly_recomendado"],
         "recomendacion": "APOSTAR" if res[mejor]["ev"] >= min_ev else "PASAR"
     }
@@ -262,10 +259,10 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     d = preparar_dataset(datos, metrica, prox)
     fit_df = d[d["Y"].notna()].iloc[WARMUP:]
     if fit_df.empty:
-        fit_df = d[d["Y"].notna()] # Fallback si hay pocos juegos
+        fit_df = d[d["Y"].notna()] # Soporte para rookies con pocos partidos jugados
         
     features = [
-        "EMA_5", "EMA_10", "EMA_20", "VOL_5", "TENDENCIA", 
+        "EMA_2", "EMA_3", "EMA_5", "EMA_10", "VOL_5", "TENDENCIA", 
         "MIN_EMA_5", "MIN_STD_5", "USG_EMA_5", 
         "VENTAJA_DESCANSO", "JUEGOS_7D", "N_AUSENTES",
         "DEF_M_RIV", "DEF_M_REC_RIV", "PACE_PARTIDO", "BLOWOUT_RISK", "HIST_RIVAL"
@@ -277,10 +274,10 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     ym = fit_df["MIN"].reset_index(drop=True)
     n = len(y)
     
-    peso_base = 0.5 ** ((n - 1 - np.arange(n)) / VIDA_MEDIA)
+    peso_base = 0.6 ** ((n - 1 - np.arange(n)) / VIDA_MEDIA)
     w = peso_base
 
-    m_min = HistGradientBoostingRegressor(loss="squared_error", max_depth=3, learning_rate=0.04, random_state=SEED)
+    m_min = HistGradientBoostingRegressor(loss="squared_error", max_depth=2, learning_rate=0.05, random_state=SEED)
     m_min.fit(X, ym, sample_weight=w)
     min_pred = float(minutos_override) if minutos_override else float(m_min.predict(x_next)[0])
     
@@ -292,16 +289,16 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     obj_xgb = "count:poisson" if metrica in ["AST", "REB", "STL", "BLK"] else "reg:tweedie"
     
     m_xgb = XGBRegressor(
-        n_estimators=150, learning_rate=0.03, max_depth=3, subsample=0.8,
-        colsample_bytree=0.8, reg_lambda=5.0, objective=obj_xgb, random_state=SEED, n_jobs=-1
+        n_estimators=100, learning_rate=0.04, max_depth=2, subsample=0.8,
+        colsample_bytree=0.8, reg_lambda=3.0, objective=obj_xgb, random_state=SEED, n_jobs=-1
     ).fit(X2, y, sample_weight=w)
     
     m_hgb = HistGradientBoostingRegressor(
         loss="poisson" if metrica in ["AST","REB","STL","BLK"] else "squared_error", 
-        max_depth=3, learning_rate=0.04, random_state=SEED
+        max_depth=2, learning_rate=0.04, random_state=SEED
     ).fit(X2, y, sample_weight=w)
     
-    m_ridge = Ridge(alpha=15.0).fit(SimpleImputer(strategy="median").fit_transform(X2), y)
+    m_ridge = Ridge(alpha=10.0).fit(SimpleImputer(strategy="median").fit_transform(X2), y)
 
     preds_xgb = m_xgb.predict(X2)
     preds_hgb = m_hgb.predict(X2)
