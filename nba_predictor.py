@@ -10,11 +10,9 @@ from scipy import stats
 from scipy.optimize import nnls
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
 from nba_api.stats.endpoints import leaguegamelog, playergamelog
@@ -22,18 +20,15 @@ from nba_api.stats.static import players
 
 warnings.filterwarnings("ignore")
 
-# --------------------------------------------------------------------------
-# CONFIGURACIÓN INSTITUCIONAL
-# --------------------------------------------------------------------------
 SEED = 42
 CACHE_DIR = "cache_nba_pro"
 CACHE_HORAS = 12
 PAUSA_API = 0.8
-WARMUP = 12               # Juegos descartados para calentar medias móviles
-MIN_JUEGOS = 50           # Mínimo histórico para inferencia
-VIDA_MEDIA = 70           # Decaimiento temporal (pesa más el jugador de hoy que el de hace 2 años)
+WARMUP = 12
+MIN_JUEGOS = 50
+VIDA_MEDIA = 70
 N_SPLITS = 5
-N_ITER_BUSQUEDA = 20      # Búsqueda más profunda de hiperparámetros
+N_ITER_BUSQUEDA = 20
 
 METRICAS = {
     "PTS": ["PTS"], "REB": ["REB"], "AST": ["AST"],
@@ -42,15 +37,12 @@ METRICAS = {
     "FG3M": ["FG3M"], "STL": ["STL"], "BLK": ["BLK"],
 }
 
-# --------------------------------------------------------------------------
-# UTILIDADES Y CACHÉ
-# --------------------------------------------------------------------------
 def _quitar_acentos(s):
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 def serie_metrica(df, metrica):
     if metrica not in METRICAS:
-        raise ValueError(f"Métrica no soportada: {metrica}")
+        raise ValueError(f"Metrica no soportada: {metrica}")
     return df[METRICAS[metrica]].sum(axis=1)
 
 def _con_cache(nombre, funcion, reintentos=4):
@@ -65,16 +57,12 @@ def _con_cache(nombre, funcion, reintentos=4):
             df = funcion()
             df.to_pickle(ruta)
             return df
-        except Exception as e:
-            print(f"  [API] intento {i + 1} falló ({nombre}): {e}")
+        except Exception:
             time.sleep(2 ** (i + 1))
     if existe:
         return pd.read_pickle(ruta)
-    raise RuntimeError(f"Error fatal descargando {nombre}")
+    raise RuntimeError(f"Error descargando {nombre}")
 
-# --------------------------------------------------------------------------
-# EXTRACCIÓN DE DATOS
-# --------------------------------------------------------------------------
 def _id_jugador(nombre):
     n = _quitar_acentos(nombre).lower().strip()
     lista = [p for p in players.get_players() if _quitar_acentos(p["full_name"]).lower() == n]
@@ -138,7 +126,7 @@ def construir_contexto_equipos(equipos, metrica):
     
     for col, nom in [("M_PERMITIDO", "DEF_M"), ("PACE_J", "PACE"), ("NET", "NET_EMA"), ("PTS_OPP", "DEF_PTS")]:
         post = g[col].transform(lambda s: s.ewm(span=10, adjust=False).mean())
-        post_corto = g[col].transform(lambda s: s.ewm(span=4, adjust=False).mean()) # Momento reciente defensivo
+        post_corto = g[col].transform(lambda s: s.ewm(span=4, adjust=False).mean())
         t[nom + "_POST"] = post
         t[nom + "_PRE"] = post.groupby(t["TEAM_ABBREVIATION"]).shift(1)
         t[nom + "_REC_PRE"] = post_corto.groupby(t["TEAM_ABBREVIATION"]).shift(1)
@@ -161,15 +149,17 @@ def calcular_ausentes(log, companeros, temporadas, incluir_playoffs):
             continue
     return aus
 
-# --------------------------------------------------------------------------
-# INGENIERÍA DE CARACTERÍSTICAS AVANZADA
-# --------------------------------------------------------------------------
+def cargar_datos(nombre, temporadas, incluir_playoffs=True, companeros_clave=None):
+    log = obtener_log_jugador(nombre, temporadas, incluir_playoffs)
+    equipos = obtener_logs_equipos(temporadas, incluir_playoffs)
+    log["N_AUSENTES"] = calcular_ausentes(log, companeros_clave or [], temporadas, incluir_playoffs)
+    return {"nombre": nombre, "log": log, "equipos": equipos}
+
 def construir_features(d, metrica):
     d = d.copy().reset_index(drop=True)
     y = serie_metrica(d, metrica)
     d["Y"] = y
     
-    # Manejo de fatiga en los ultimos 7 dias
     d["JUEGOS_7D"] = d.apply(lambda row: ((d["GAME_DATE"] >= row["GAME_DATE"] - pd.Timedelta(days=7)) & (d["GAME_DATE"] < row["GAME_DATE"])).sum(), axis=1)
 
     for span in (3, 5, 10, 20):
@@ -178,34 +168,29 @@ def construir_features(d, metrica):
     d["VOL_5"] = y.rolling(5).std().shift(1).fillna(0)
     d["TENDENCIA"] = d["EMA_5"] - d["EMA_20"]
     
-    # Proxy de Usage Rate (Impacto Ofensivo Real)
     d["USG_PROXY"] = np.where(d["MIN"] > 0, (d["FGA"] + 0.44 * d["FTA"] + d["TOV"]) / d["MIN"], 0)
     d["USG_EMA_5"] = d["USG_PROXY"].ewm(span=5, adjust=False).mean().shift(1)
     
     d["MIN_EMA_5"] = d["MIN"].ewm(span=5, adjust=False).mean().shift(1)
     d["MIN_STD_5"] = d["MIN"].rolling(5).std().shift(1).fillna(0)
     
-    # Ventaja de descanso (Rest Advantage)
     d["DIAS_DESCANSO"] = d["DIAS_DESC_EQ_PROP"].fillna(3).clip(1, 7)
     d["DIAS_DESCANSO_RIV"] = d["DIAS_DESC_EQ_RIV"].fillna(3).clip(1, 7)
     d["VENTAJA_DESCANSO"] = d["DIAS_DESCANSO"] - d["DIAS_DESCANSO_RIV"]
     d["B2B"] = (d["DIAS_DESCANSO"] == 1).astype(int)
 
-    # Contexto Rival (Largo Plazo vs Corto Plazo para detectar rachas defensivas)
     d["DEF_M_RIV"] = d["DEF_M_PRE_RIV"]
-    d["DEF_M_REC_RIV"] = d["DEF_M_REC_PRE_RIV"] # Defensa reciente
+    d["DEF_M_REC_RIV"] = d["DEF_M_REC_PRE_RIV"]
     d["PACE_PARTIDO"] = (d["PACE_PRE_PROP"] + d["PACE_PRE_RIV"]) / 2
     d["DIF_FUERZA"] = d["NET_EMA_PRE_PROP"] - d["NET_EMA_PRE_RIV"]
     
-    # Ajuste por blowout proyectado
     d["BLOWOUT_RISK"] = d["DIF_FUERZA"].abs().clip(lower=0, upper=20)
     
-    # Rendimiento Histórico vs ESTE Rival
     yy = y.fillna(0)
     visto = y.notna().astype(int)
     suma = yy.groupby(d["RIVAL"]).cumsum() - yy
     n = visto.groupby(d["RIVAL"]).cumsum() - visto
-    d["HIST_RIVAL"] = (suma + 3 * d["EMA_20"]) / (n + 3) # Shrinkage Bayesiano
+    d["HIST_RIVAL"] = (suma + 3 * d["EMA_20"]) / (n + 3)
 
     return d
 
@@ -247,11 +232,7 @@ def preparar_dataset(datos, metrica, prox):
         
     return d
 
-# --------------------------------------------------------------------------
-# META-ENSAMBLE DE MODELOS Y MATEMÁTICAS DE APUESTAS
-# --------------------------------------------------------------------------
 def buscar_hiperparametros(X, y, w, rng, metrica_tipo):
-    # Asigna la funcion de perdida segun la metrica (Poisson para conteos es ORO)
     obj = "count:poisson" if metrica_tipo in ["AST", "REB", "STL", "BLK"] else "reg:tweedie"
     
     mejor, mejor_mae = None, np.inf
@@ -279,11 +260,10 @@ def buscar_hiperparametros(X, y, w, rng, metrica_tipo):
 
 def evaluar_apuesta(prob_over, cuota_over, cuota_under, n_oof, min_ev=0.03):
     p_imp_o = 1 / cuota_over
-    p_imp_u = 1 / cuota_under if cuota_under else p_imp_o / 1.045 # Asume vig de 4.5% si no hay under
+    p_imp_u = 1 / cuota_under if cuota_under else p_imp_o / 1.045
     p_mkt_over = p_imp_o / (p_imp_o + p_imp_u)
     
-    # Kelly fraccionado adaptativo
-    w = min(n_oof / (n_oof + 80), 0.85) # Confianza máxima del modelo = 85% vs Mercado
+    w = min(n_oof / (n_oof + 80), 0.85)
     p_over = w * prob_over + (1 - w) * p_mkt_over
     p_under = 1 - p_over
     
@@ -291,7 +271,7 @@ def evaluar_apuesta(prob_over, cuota_over, cuota_under, n_oof, min_ev=0.03):
     for lado, p, c in [("OVER", p_over, cuota_over), ("UNDER", p_under, cuota_under)]:
         if not c: continue
         ev = (p * (c - 1)) - (1 - p)
-        kelly = max(0.0, ev / (c - 1)) * 0.25 # Cuarto de Kelly (Control de riesgo estricto)
+        kelly = max(0.0, ev / (c - 1)) * 0.25
         res[lado] = {"prob": round(p, 4), "ev": round(ev, 4), "kelly_recomendado": round(min(kelly, 0.05), 4)}
         
     mejor = max(res, key=lambda k: res[k]["ev"])
@@ -305,7 +285,7 @@ def evaluar_apuesta(prob_over, cuota_over, cuota_under, n_oof, min_ev=0.03):
 def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoffs=False,
              companeros_fuera_hoy=None, minutos_override=None, spread=None, cuota_over=None, cuota_under=None):
     
-    rng = np.random.default_rng(SEED)
+    rng = np.random.defaultrng(SEED)
     prox = {"rival": rival, "local": local, "fecha": fecha_juego, "playoffs": playoffs,
             "fuera_hoy": companeros_fuera_hoy or [], "spread": spread}
     
@@ -325,15 +305,13 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     ym = fit_df["MIN"].reset_index(drop=True)
     n = len(y)
     
-    # Context Weighting: Da más peso a juegos pasados donde faltaron la misma cantidad de compañeros
     peso_base = 0.5 ** ((n - 1 - np.arange(n)) / VIDA_MEDIA)
     if len(prox["fuera_hoy"]) > 0:
         similitud_contexto = (fit_df["N_AUSENTES"] == len(prox["fuera_hoy"])).to_numpy()
-        w = peso_base * np.where(similitud_contexto, 1.5, 1.0) # Multiplicador de contexto
+        w = peso_base * np.where(similitud_contexto, 1.5, 1.0)
     else:
         w = peso_base
 
-    # ETAPA 1: Predicción de Minutos
     m_min = HistGradientBoostingRegressor(loss="squared_error", max_depth=4, learning_rate=0.03, random_state=SEED)
     m_min.fit(X, ym, sample_weight=w)
     min_pred = float(minutos_override) if minutos_override else float(m_min.predict(x_next)[0])
@@ -343,35 +321,26 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
     x2_next = x_next.copy()
     x2_next["MIN_PRED"] = min_pred
 
-    # ETAPA 2: Meta-Ensamble
-    # 1. XGBoost Específico (Poisson o Tweedie)
     params = buscar_hiperparametros(X2, y, w, rng, metrica)
     m_xgb = XGBRegressor(**params, random_state=SEED, n_jobs=1, verbosity=0).fit(X2, y, sample_weight=w)
-    # 2. HistGradientBoosting (LigthGBM Proxy)
     m_hgb = HistGradientBoostingRegressor(loss="poisson" if metrica in ["AST","REB","STL","BLK"] else "squared_error", 
                                           max_depth=3, random_state=SEED).fit(X2, y, sample_weight=w)
-    # 3. Baseline Lineal
     m_ridge = Ridge(alpha=20.0).fit(SimpleImputer(strategy="median").fit_transform(X2), y)
 
     preds_xgb = m_xgb.predict(X2)
     preds_hgb = m_hgb.predict(X2)
     preds_lin = m_ridge.predict(SimpleImputer(strategy="median").fit_transform(X2))
     
-    # NNLS (Non-Negative Least Squares) para descubrir quién proyecta mejor históricamente
     A = np.column_stack([preds_xgb, preds_hgb, preds_lin])
     pesos, _ = nnls(A, y.to_numpy())
     pesos = pesos / pesos.sum() if pesos.sum() > 0 else np.array([0.4, 0.4, 0.2])
     
-    # Proyección final
     nx_imp = SimpleImputer(strategy="median").fit(X2).transform(x2_next)
     mu = float(np.clip(pesos @ np.array([m_xgb.predict(x2_next)[0], m_hgb.predict(x2_next)[0], m_ridge.predict(nx_imp)[0]]), 0, None))
 
-    # ETAPA 3: Simulación Monte Carlo y Probabilidad
     oof_ens = A @ pesos
     residuos = y.to_numpy() - oof_ens
-    var_residuos = np.maximum(residuos**2, mu * 1.05) # Varianza mínima
     
-    # Bootstrap Simulación
     sim = np.maximum(0, np.round(mu + rng.choice(residuos, size=15000, replace=True)))
     p_boot = float(np.mean(sim > linea))
     
@@ -388,20 +357,3 @@ def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoff
         resultado["analisis_apuesta"] = evaluar_apuesta(p_boot, cuota_over, cuota_under, len(y))
         
     return resultado
-
-# --------------------------------------------------------------------------
-# EJECUCIÓN DEL SCRIPT
-# --------------------------------------------------------------------------
-if __name__ == "__main__":
-    datos = cargar_datos("LeBron James", ["2024-25", "2025-26"], companeros_clave=["Anthony Davis"])
-    
-    res = analizar(
-        datos=datos, metrica="PRA", linea=38.5, rival="GSW", local=True,
-        fecha_juego="2026-11-06", # Toma en cuenta fatiga exacta a la fecha
-        companeros_fuera_hoy=[],  # Agrega "Anthony Davis" si se lesiona para ver el impacto en usage
-        spread=-4.5,              # Lakers favoritos por 4.5
-        cuota_over=1.90, cuota_under=1.90
-    )
-    
-    print("\n--- REPORTE PROFESIONAL ---")
-    print(json.dumps(res, indent=4, ensure_ascii=False))
