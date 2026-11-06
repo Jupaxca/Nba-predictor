@@ -123,25 +123,66 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------
-# FUNCIONES AUXILIARES DE BÚSQUEDA INTERACTIVA EN CASCADA
+# BASE DE DATOS Y BÚSQUEDA EN CASCADA
 # ---------------------------------------------------------------------
+HEADERS_NBA = {
+    'Host': 'stats.nba.com',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': 'https://www.nba.com/'
+}
+
+PLANTILLAS_BASE = {
+    "Los Angeles Lakers": ["LeBron James", "Anthony Davis", "Austin Reaves", "D'Angelo Russell", "Rui Hachimura", "Jarred Vanderbilt", "Gabe Vincent", "Jaxson Hayes", "Dalton Knecht", "Bronny James"],
+    "Golden State Warriors": ["Stephen Curry", "Draymond Green", "Jonathan Kuminga", "Brandin Podziemski", "Andrew Wiggins", "Kevon Looney", "Buddy Hield", "Kyle Anderson", "De'Anthony Melton", "Moses Moody"],
+    "Boston Celtics": ["Jayson Tatum", "Jaylen Brown", "Kristaps Porzingis", "Jrue Holiday", "Derrick White", "Al Horford", "Payton Pritchard", "Sam Hauser", "Luke Kornet"],
+    "Denver Nuggets": ["Nikola Jokic", "Jamal Murray", "Aaron Gordon", "Michael Porter Jr.", "Russell Westbrook", "Christian Braun", "Peyton Watson", "DeAndre Jordan", "Dario Saric"],
+    "Milwaukee Bucks": ["Giannis Antetokounmpo", "Damian Lillard", "Khris Middleton", "Brook Lopez", "Bobby Portis", "Gary Trent Jr.", "Taurean Prince", "Delon Wright"],
+    "Phoenix Suns": ["Kevin Durant", "Devin Booker", "Bradley Beal", "Jusuf Nurkic", "Tyus Jones", "Grayson Allen", "Royce O'Neale", "Mason Plumlee"],
+    "Dallas Mavericks": ["Luka Doncic", "Kyrie Irving", "Klay Thompson", "P.J. Washington", "Daniel Gafford", "Dereck Lively II", "Naji Marshall", "Quentin Grimes", "Spencer Dinwiddie"],
+    "Minnesota Timberwolves": ["Anthony Edwards", "Julius Randle", "Donte DiVincenzo", "Rudy Gobert", "Mike Conley", "Jaden McDaniels", "Naz Reid", "Nickeil Alexander-Walker"],
+    "New York Knicks": ["Jalen Brunson", "Karl-Anthony Towns", "Mikal Bridges", "OG Anunoby", "Josh Hart", "Mitchell Robinson", "Miles McBride", "Precious Achiuwa"],
+    "Philadelphia 76ers": ["Joel Embiid", "Tyrese Maxey", "Paul George", "Kelly Oubre Jr.", "Caleb Martin", "Kyle Lowry", "Andre Drummond", "Eric Gordon"],
+    "Miami Heat": ["Jimmy Butler", "Bam Adebayo", "Tyler Herro", "Terry Rozier", "Jaime Jaquez Jr.", "Nikola Jovic", "Duncan Robinson", "Kevin Love"],
+    "Oklahoma City Thunder": ["Shai Gilgeous-Alexander", "Chet Holmgren", "Jalen Williams", "Alex Caruso", "Isaiah Hartenstein", "Luguentz Dort", "Cason Wallace", "Isaiah Joe"],
+    "Indiana Pacers": ["Tyrese Haliburton", "Pascal Siakam", "Myles Turner", "Bennedict Mathurin", "Andrew Nembhard", "Aaron Nesmith", "T.J. McConnell", "Obi Toppin"],
+    "Cleveland Cavaliers": ["Donovan Mitchell", "Darius Garland", "Evan Mobley", "Jarrett Allen", "Caris LeVert", "Max Strus", "Isaac Okoro", "Dean Wade"],
+    "Memphis Grizzlies": ["Ja Morant", "Jaren Jackson Jr.", "Desmond Bane", "Marcus Smart", "Zach Edey", "Santi Aldama", "Brandon Clarke", "Vince Williams Jr."],
+    "Sacramento Kings": ["De'Aaron Fox", "Domantas Sabonis", "DeMar DeRozan", "Keegan Murray", "Malik Monk", "Kevin Huerter", "Trey Lyles", "Keon Ellis"],
+    "Orlando Magic": ["Paolo Banchero", "Franz Wagner", "Jalen Suggs", "Kentavious Caldwell-Pope", "Wendell Carter Jr.", "Cole Anthony", "Jonathan Isaac", "Moritz Wagner"],
+    "Atlanta Hawks": ["Trae Young", "Jalen Johnson", "Dyson Daniels", "Clint Capela", "Bogdan Bogdanovic", "Onyeka Okongwu", "Zaccharie Risacher", "De'Andre Hunter"],
+    "Chicago Bulls": ["Coby White", "Zach LaVine", "Nikola Vucevic", "Josh Giddey", "Lonzo Ball", "Patrick Williams", "Ayo Dosunmu", "Matas Buzelis"],
+    "Los Angeles Clippers": ["Kawhi Leonard", "James Harden", "Ivica Zubac", "Norman Powell", "Terance Mann", "Derrick Jones Jr.", "Nicolas Batum", "Kris Dunn"],
+    "Houston Rockets": ["Alperen Sengun", "Jalen Green", "Fred VanVleet", "Jabari Smith Jr.", "Dillon Brooks", "Amen Thompson", "Tari Eason", "Reed Sheppard"],
+    "San Antonio Spurs": ["Victor Wembanyama", "Chris Paul", "Devin Vassell", "Stephon Castle", "Jeremy Sochan", "Keldon Johnson", "Harrison Barnes", "Tre Jones"],
+    "New Orleans Pelicans": ["Zion Williamson", "Brandon Ingram", "CJ McCollum", "DeJounte Murray", "Herbert Jones", "Trey Murphy III", "Yves Missi", "Jose Alvarado"],
+    "Brooklyn Nets": ["Cam Thomas", "Dennis Schroder", "Nic Claxton", "Ben Simmons", "Cam Johnson", "Dorian Finney-Smith", "Bojan Bogdanovic", "Day'Ron Sharpe"],
+    "Charlotte Hornets": ["LaMelo Ball", "Brandon Miller", "Miles Bridges", "Nick Richards", "Grant Williams", "Tre Mann", "Josh Green", "Tidjane Salaun"],
+    "Detroit Pistons": ["Cade Cunningham", "Jaden Ivey", "Tobias Harris", "Jalen Duren", "Malik Beasley", "Tim Hardaway Jr.", "Ausar Thompson", "Isaiah Stewart"],
+    "Toronto Raptors": ["Scottie Barnes", "RJ Barrett", "Immanuel Quickley", "Jakob Poeltl", "Gradey Dick", "Kelly Olynyk", "Davion Mitchell", "Bruce Brown"],
+    "Portland Trail Blazers": ["Anfernee Simons", "Jerami Grant", "Deandre Ayton", "Scoot Henderson", "Shaedon Sharpe", "Toumani Camara", "Deni Avdija", "Donovan Clingan"],
+    "Utah Jazz": ["Lauri Markkanen", "Collin Sexton", "Walker Kessler", "John Collins", "Keyonte George", "Jordan Clarkson", "Taylor Hendricks", "Cody Williams"],
+    "Washington Wizards": ["Kyle Kuzma", "Jordan Poole", "Jonas Valanciunas", "Alexandre Sarr", "Malcolm Brogdon", "Bub Carrington", "Corey Kispert", "Bilal Coulibaly"]
+}
+
 @st.cache_data(ttl=86400)
 def obtener_diccionario_equipos():
     lista = teams.get_teams()
     lista_ordenada = sorted(lista, key=lambda x: x['full_name'])
     return {t['full_name']: {'abbrev': t['abbreviation'], 'id': t['id']} for t in lista_ordenada}
 
-@st.cache_data(ttl=86400)
-def obtener_plantilla_equipo(team_id):
-    temporadas = ["2026-27", "2025-26"]
-    for temp in temporadas:
-        try:
-            roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=temp, timeout=15).get_data_frames()[0]
-            if not roster.empty and 'PLAYER' in roster.columns:
-                return sorted(roster['PLAYER'].unique().tolist())
-        except Exception:
-            continue
-    return []
+@st.cache_data(ttl=3600)
+def obtener_plantilla_equipo(equipo_nombre, team_id):
+    try:
+        roster = commonteamroster.CommonTeamRoster(team_id=team_id, headers=HEADERS_NBA, timeout=8).get_data_frames()[0]
+        if not roster.empty and 'PLAYER' in roster.columns:
+            lista = sorted(roster['PLAYER'].unique().tolist())
+            if len(lista) > 0:
+                return lista
+    except Exception:
+        pass
+    return PLANTILLAS_BASE.get(equipo_nombre, ["LeBron James", "Anthony Davis", "Stephen Curry", "Luka Doncic", "Nikola Jokic"])
 
 equipos_dict = obtener_diccionario_equipos()
 nombres_equipos = list(equipos_dict.keys())
@@ -171,21 +212,23 @@ col1, col2, col3 = st.columns(3)
 
 with col1:
     idx_lakers = nombres_equipos.index("Los Angeles Lakers") if "Los Angeles Lakers" in nombres_equipos else 0
-    equipo_jugador = st.selectbox("1. Equipo del Jugador", nombres_equipos, index=idx_lakers)
+    equipo_jugador = st.selectbox("1. Equipo del Jugador", nombres_equipos, index=idx_lakers, key="sel_equipo_jugador")
     
     team_id = equipos_dict[equipo_jugador]['id']
-    plantilla = obtener_plantilla_equipo(team_id)
+    plantilla = obtener_plantilla_equipo(equipo_jugador, team_id)
     
-    if plantilla:
-        idx_lebron = plantilla.index("LeBron James") if "LeBron James" in plantilla else 0
-        jugador = st.selectbox("2. Jugador a analizar", plantilla, index=idx_lebron, key=f"sel_jugador_{team_id}")
-    else:
-        jugador = st.text_input("2. Nombre del jugador", value="LeBron James")
+    # Lista desplegable en cascada estricta para el jugador
+    jugador = st.selectbox(
+        "2. Jugador a analizar",
+        options=plantilla,
+        index=0,
+        key=f"sel_jugador_{equipo_jugador}"
+    )
 
 with col2:
     rivales_disponibles = [eq for eq in nombres_equipos if eq != equipo_jugador]
     idx_gsw = rivales_disponibles.index("Golden State Warriors") if "Golden State Warriors" in rivales_disponibles else 0
-    equipo_rival_nombre = st.selectbox("3. Equipo Rival", rivales_disponibles, index=idx_gsw)
+    equipo_rival_nombre = st.selectbox("3. Equipo Rival", rivales_disponibles, index=idx_gsw, key="sel_equipo_rival")
     
     rival_abrev = equipos_dict[equipo_rival_nombre]['abbrev']
     metrica = st.selectbox("Métrica a evaluar", ["PTS", "REB", "AST", "PRA", "PR", "PA", "RA", "FG3M", "STL", "BLK"])
@@ -195,9 +238,10 @@ with col3:
     local = st.checkbox("Juega de Local", value=True)
     playoffs = st.checkbox("Es Partido de Playoffs", value=False)
 
-companeros_disponibles = [p for p in plantilla if p != jugador] if plantilla else []
+# Companeros ausentes filtrados en cascada segun el equipo y excluyendo al jugador seleccionado
+companeros_disponibles = [p for p in plantilla if p != jugador]
 
-with st.expander(" Parámetros Avanzados (Opciones de Mercado y Ausencias)"):
+with st.expander(" Parámetros Avanzados (Opciones de Mercado y Ausencias)", expanded=True):
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         spread = st.number_input("Handicap / Spread (Favorito -4.5)", value=0.0, step=0.5)
@@ -210,7 +254,7 @@ with st.expander(" Parámetros Avanzados (Opciones de Mercado y Ausencias)"):
             "Compañeros ausentes hoy",
             options=companeros_disponibles,
             default=[],
-            key=f"ausentes_{team_id}_{jugador}"
+            key=f"ausentes_{equipo_jugador}_{jugador}"
         )
 
 ejecutar = st.button("Ejecutar Modelo Predictivo", type="primary", use_container_width=True)
