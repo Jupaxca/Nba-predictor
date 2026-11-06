@@ -1,332 +1,286 @@
-import os
-import time
-import json
-import warnings
-import unicodedata
-
-import numpy as np
+import streamlit as st
 import pandas as pd
-from scipy import stats
-from scipy.optimize import nnls
-from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error
-from xgboost import XGBRegressor
+import json
+from nba_api.stats.static import teams, players
+from nba_predictor import cargar_datos, analizar
 
-from nba_api.stats.endpoints import leaguegamelog, playergamelog
-from nba_api.stats.static import players
+st.set_page_config(
+    page_title="NBAMetrics Pro",
+    page_icon="🏀",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-warnings.filterwarnings("ignore")
+st.markdown(
+    """
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Oswald:wght@600;700&display=swap');
 
-SEED = 42
-CACHE_DIR = "cache_nba_pro"
-CACHE_HORAS = 12
-PAUSA_API = 0.5
-WARMUP = 5
-VIDA_MEDIA = 55 # Balance ideal para ponderar temporada actual y arrastre de la pasada
-
-METRICAS = {
-    "PTS": ["PTS"], "REB": ["REB"], "AST": ["AST"],
-    "PRA": ["PTS", "REB", "AST"], "PR": ["PTS", "REB"],
-    "PA": ["PTS", "AST"], "RA": ["REB", "AST"],
-    "FG3M": ["FG3M"], "STL": ["STL"], "BLK": ["BLK"],
-}
-
-def _quitar_acentos(s):
-    if not s: return ""
-    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-
-def serie_metrica(df, metrica):
-    if metrica not in METRICAS:
-        raise ValueError(f"Metrica no soportada: {metrica}")
-    return df[METRICAS[metrica]].sum(axis=1)
-
-def _con_cache(nombre, funcion, reintentos=3):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    ruta = os.path.join(CACHE_DIR, nombre + ".pkl")
-    existe = os.path.exists(ruta)
-    if existe and (time.time() - os.path.getmtime(ruta)) < CACHE_HORAS * 3600:
-        return pd.read_pickle(ruta)
-    for i in range(reintentos):
-        try:
-            time.sleep(PAUSA_API)
-            df = funcion()
-            if df is not None and not df.empty:
-                df.to_pickle(ruta)
-                return df
-        except Exception:
-            time.sleep(1.0 * (i + 1))
-    if existe:
-        return pd.read_pickle(ruta)
-    return None
-
-def _id_jugador(nombre):
-    busqueda = _quitar_acentos(nombre).lower().strip()
-    todos = players.get_players()
-    
-    for p in todos:
-        if _quitar_acentos(p["full_name"]).lower().strip() == busqueda:
-            return p["id"]
-            
-    for p in todos:
-        if busqueda in _quitar_acentos(p["full_name"]).lower().strip():
-            return p["id"]
-            
-    raise ValueError(f"Jugador no encontrado en la base de datos de la NBA: {nombre}")
-
-def obtener_log_jugador(nombre, temporadas, incluir_playoffs=True):
-    pid = _id_jugador(nombre)
-    tipos = ["Regular Season"] + (["Playoffs"] if incluir_playoffs else [])
-    partes = []
-    
-    # Cargamos tanto la temporada pasada como la actual para dar contexto histórico y de volumen
-    for temp in temporadas:
-        for tipo in tipos:
-            clave = f"jug_{pid}_{temp}_{tipo.replace(' ', '')}"
-            try:
-                def llamada(t=temp, ty=tipo):
-                    return playergamelog.PlayerGameLog(
-                        player_id=pid, season=t, season_type_all_star=ty, timeout=20
-                    ).get_data_frames()[0]
-                
-                df = _con_cache(clave, llamada)
-                if df is not None and not df.empty:
-                    df = df.copy()
-                    df["ES_PLAYOFF"] = int(tipo == "Playoffs")
-                    partes.append(df)
-            except Exception:
-                continue
-                
-    if not partes:
-        raise ValueError(f"No se pudieron cargar partidos para {nombre}")
-        
-    df = pd.concat(partes, ignore_index=True)
-    df = df.rename(columns={"Game_ID": "GAME_ID"})
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    df = df.sort_values("GAME_DATE").reset_index(drop=True)
-    df["EQUIPO"] = df["MATCHUP"].str.split().str[0]
-    df["RIVAL"] = df["MATCHUP"].str.split().str[-1]
-    df["ES_LOCAL"] = df["MATCHUP"].str.contains("vs.", regex=False).astype(int)
-    return df
-
-def obtener_logs_equipos(temporadas, incluir_playoffs=True):
-    tipos = ["Regular Season"] + (["Playoffs"] if incluir_playoffs else [])
-    partes = []
-    for temp in temporadas:
-        for tipo in tipos:
-            clave = f"equipos_{temp}_{tipo.replace(' ', '')}"
-            try:
-                def llamada(t=temp, ty=tipo):
-                    return leaguegamelog.LeagueGameLog(
-                        season=t, player_or_team_abbreviation="T", season_type_all_star=ty, timeout=20
-                    ).get_data_frames()[0]
-                df = _con_cache(clave, llamada)
-                if df is not None and not df.empty:
-                    partes.append(df.copy())
-            except Exception:
-                continue
-    if not partes:
-        return pd.DataFrame()
-    eq = pd.concat(partes, ignore_index=True)
-    eq["GAME_DATE"] = pd.to_datetime(eq["GAME_DATE"])
-    return eq
-
-def construir_contexto_equipos(equipos, metrica):
-    if equipos.empty:
-        return pd.DataFrame(columns=["GAME_ID", "TEAM_ABBREVIATION", "DEF_M_POST", "PACE_POST", "NET_EMA_POST"])
-    
-    t = equipos.copy()
-    t["POSS"] = t["FGA"] + 0.44 * t["FTA"] - t["OREB"] + t["TOV"]
-    t["M_EQ"] = serie_metrica(t, metrica)
-    opp = t[["GAME_ID", "TEAM_ABBREVIATION", "PTS", "POSS", "M_EQ"]].rename(columns={
-        "TEAM_ABBREVIATION": "OPP", "PTS": "PTS_OPP", "POSS": "POSS_OPP", "M_EQ": "M_PERMITIDO"})
-    t = t.merge(opp, on="GAME_ID")
-    t = t[t["TEAM_ABBREVIATION"] != t["OPP"]].drop_duplicates(["GAME_ID", "TEAM_ABBREVIATION"])
-    t = t.sort_values(["TEAM_ABBREVIATION", "GAME_DATE"]).reset_index(drop=True)
-    t["PACE_J"] = (t["POSS"] + t["POSS_OPP"]) / 2
-    t["NET"] = t["PTS"] - t["PTS_OPP"]
-    
-    g = t.groupby("TEAM_ABBREVIATION")
-    t["DIAS_DESC_EQ"] = g["GAME_DATE"].diff().dt.days
-    
-    for col, nom in [("M_PERMITIDO", "DEF_M"), ("PACE_J", "PACE"), ("NET", "NET_EMA"), ("PTS_OPP", "DEF_PTS")]:
-        post = g[col].transform(lambda s: s.ewm(span=8, adjust=False).mean())
-        post_corto = g[col].transform(lambda s: s.ewm(span=3, adjust=False).mean())
-        t[nom + "_POST"] = post
-        t[nom + "_PRE"] = post.groupby(t["TEAM_ABBREVIATION"]).shift(1)
-        t[nom + "_REC_PRE"] = post_corto.groupby(t["TEAM_ABBREVIATION"]).shift(1)
-        
-    return t
-
-def cargar_datos(nombre, temporadas, incluir_playoffs=True, companeros_clave=None):
-    # Solicitamos tanto la temporada pasada como la actual
-    log = obtener_log_jugador(nombre, ["2025-26", "2026-27"], incluir_playoffs)
-    equipos = obtener_logs_equipos(["2025-26", "2026-27"], incluir_playoffs)
-    log["N_AUSENTES"] = 0.0
-    return {"nombre": nombre, "log": log, "equipos": equipos}
-
-def construir_features(d, metrica):
-    d = d.copy().reset_index(drop=True)
-    y = serie_metrica(d, metrica)
-    d["Y"] = y
-    
-    d["JUEGOS_7D"] = d.apply(lambda row: ((d["GAME_DATE"] >= row["GAME_DATE"] - pd.Timedelta(days=7)) & (d["GAME_DATE"] < row["GAME_DATE"])).sum(), axis=1)
-
-    for span in (3, 5, 10, 20):
-        d[f"EMA_{span}"] = y.ewm(span=span, adjust=False).mean().shift(1)
-    
-    d["VOL_5"] = y.rolling(5).std().shift(1).fillna(0)
-    d["TENDENCIA"] = d["EMA_5"] - d["EMA_20"]
-    
-    d["USG_PROXY"] = np.where(d["MIN"] > 0, (d["FGA"] + 0.44 * d["FTA"] + d["TOV"]) / d["MIN"], 0)
-    d["USG_EMA_5"] = d["USG_PROXY"].ewm(span=5, adjust=False).mean().shift(1)
-    
-    d["MIN_EMA_5"] = d["MIN"].ewm(span=5, adjust=False).mean().shift(1)
-    d["MIN_STD_5"] = d["MIN"].rolling(5).std().shift(1).fillna(0)
-    
-    d["DIAS_DESCANSO"] = 3
-    d["DIAS_DESCANSO_RIV"] = 3
-    d["VENTAJA_DESCANSO"] = 0
-    d["B2B"] = 0
-
-    d["DEF_M_RIV"] = 0.0
-    d["DEF_M_REC_RIV"] = 0.0
-    d["PACE_PARTIDO"] = 100.0
-    d["DIF_FUERZA"] = 0.0
-    d["BLOWOUT_RISK"] = 0.0
-    
-    yy = y.fillna(0)
-    visto = y.notna().astype(int)
-    suma = yy.groupby(d["RIVAL"]).cumsum() - yy
-    n = visto.groupby(d["RIVAL"]).cumsum() - visto
-    d["HIST_RIVAL"] = (suma + 3 * d["EMA_10"]) / (n + 3)
-
-    return d
-
-def preparar_dataset(datos, metrica, prox):
-    log = datos["log"].copy()
-    ctx = construir_contexto_equipos(datos["equipos"], metrica)
-    
-    equipo = log["EQUIPO"].iloc[-1] if not log.empty else "LAL"
-    rival = prox["rival"]
-    fecha = pd.Timestamp(prox["fecha"]) if prox["fecha"] else pd.Timestamp.now()
-    
-    nueva = {c: np.nan for c in log.columns}
-    nueva.update(
-        GAME_ID="PROX", GAME_DATE=fecha, EQUIPO=equipo, RIVAL=rival,
-        MATCHUP=f"{equipo} {'vs.' if prox['local'] else '@'} {rival}",
-        ES_LOCAL=int(prox["local"]), ES_PLAYOFF=int(prox["playoffs"]),
-        N_AUSENTES=0.0, MIN=log["MIN"].iloc[-1] if not log.empty else 30.0,
-        FGA=14.0, FTA=4.0, TOV=2.5
-    )
-    
-    log = pd.concat([log, pd.DataFrame([nueva])], ignore_index=True)
-    d = construir_features(log, metrica)
-    return d
-
-def evaluar_apuesta(prob_over, cuota_over, cuota_under, n_oof, min_ev=0.03):
-    p_imp_o = 1 / cuota_over
-    p_imp_u = 1 / cuota_under if cuota_under else p_imp_o / 1.045
-    p_mkt_over = p_imp_o / (p_imp_o + p_imp_u)
-    
-    w = min(n_oof / (n_oof + 60), 0.85)
-    p_over = w * prob_over + (1 - w) * p_mkt_over
-    p_under = 1 - p_over
-    
-    res = {}
-    for lado, p, c in [("OVER", p_over, cuota_over), ("UNDER", p_under, cuota_under)]:
-        if not c: continue
-        ev = (p * (c - 1)) - (1 - p)
-        kelly = max(0.0, ev / (c - 1)) * 0.25
-        res[lado] = {"prob": round(p, 4), "ev": round(ev, 4), "kelly_recomendado": round(min(kelly, 0.05), 4)}
-        
-    mejor = max(res, key=lambda k: res[k]["ev"])
-    return {
-        "lado": mejor,
-        "EV": res[mejor]["EV"] if "EV" in res[mejor] else res[mejor]["ev"],
-        "kelly": res[mejor]["kelly_recomendado"],
-        "recomendacion": "APOSTAR" if res[mejor]["ev"] >= min_ev else "PASAR"
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+        background-color: #070a12;
+        color: #f3f4f6;
     }
 
-def analizar(datos, metrica, linea, rival, local=True, fecha_juego=None, playoffs=False,
-             companeros_fuera_hoy=None, minutos_override=None, spread=None, cuota_over=None, cuota_under=None):
-    
-    rng = np.random.default_rng(SEED)
-    prox = {"rival": rival, "local": local, "fecha": fecha_juego, "playoffs": playoffs, "spread": spread}
-    
-    d = preparar_dataset(datos, metrica, prox)
-    fit_df = d[d["Y"].notna()].iloc[WARMUP:]
-    if fit_df.empty:
-        fit_df = d[d["Y"].notna()]
-        
-    features = [
-        "EMA_3", "EMA_5", "EMA_10", "EMA_20", "VOL_5", "TENDENCIA", 
-        "MIN_EMA_5", "MIN_STD_5", "USG_EMA_5", 
-        "VENTAJA_DESCANSO", "JUEGOS_7D", "N_AUSENTES",
-        "DEF_M_RIV", "DEF_M_REC_RIV", "PACE_PARTIDO", "BLOWOUT_RISK", "HIST_RIVAL"
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+        max-width: 1250px;
+    }
+
+    .hero-box {
+        background: linear-gradient(145deg, #0f172a 0%, #070a12 100%);
+        padding: 32px 24px;
+        border-radius: 16px;
+        color: white;
+        text-align: center;
+        border: 1px solid #1e293b;
+        margin-bottom: 24px;
+        position: relative;
+        overflow: hidden;
+    }
+    .hero-box::before {
+        content: '';
+        position: absolute;
+        top: 0; left: 0; right: 0; height: 4px;
+        background: linear-gradient(90deg, #17408b 0%, #c9082a 50%, #f59e0b 100%);
+    }
+
+    .hero-title {
+        font-family: 'Oswald', sans-serif;
+        font-weight: 700;
+        font-size: 36px;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+        margin: 0;
+        background: linear-gradient(90deg, #ffffff 60%, #cbd5e1 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+
+    .nba-card {
+        background-color: #0f172a;
+        border: 1px solid #1e293b;
+        border-radius: 14px;
+        padding: 22px;
+        margin-bottom: 20px;
+        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
+    }
+
+    .pill-badge {
+        display: inline-block;
+        padding: 5px 12px;
+        border-radius: 999px;
+        font-size: 0.82rem;
+        font-weight: 600;
+    }
+    .pill-blue {
+        background: rgba(23, 64, 139, 0.25);
+        color: #60a5fa;
+        border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+
+    [data-testid="stMetricValue"] {
+        font-family: 'Oswald', sans-serif;
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #f8fafc;
+    }
+    [data-testid="stMetricLabel"] {
+        color: #94a3b8;
+        font-size: 0.85rem;
+    }
+
+    .stButton button[kind="primary"] {
+        background: linear-gradient(135deg, #c9082a 0%, #990620 100%);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        font-weight: 700;
+        font-size: 1rem;
+        padding: 0.6rem 1.2rem;
+        box-shadow: 0 4px 14px rgba(201, 8, 42, 0.35);
+    }
+    .stButton button[kind="primary"]:hover {
+        background: linear-gradient(135deg, #e11d48 0%, #b91c1c 100%);
+        box-shadow: 0 6px 18px rgba(225, 29, 72, 0.5);
+    }
+
+    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
+        border-radius: 8px !important;
+        background-color: #070a12 !important;
+        border-color: #1e293b !important;
+    }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+@st.cache_data
+def obtener_diccionario_equipos():
+    lista = teams.get_teams()
+    lista_ordenada = sorted(lista, key=lambda x: x['full_name'])
+    return {t['full_name']: {'abbrev': t['abbreviation'], 'id': t['id']} for t in lista_ordenada}
+
+@st.cache_data
+def obtener_lista_completa_jugadores():
+    try:
+        activos = players.get_active_players()
+        nombres = sorted([p['full_name'] for p in activos])
+        if nombres:
+            return nombres
+    except Exception:
+        pass
+    return [
+        "LeBron James", "Luka Doncic", "Stephen Curry", "Giannis Antetokounmpo",
+        "Nikola Jokic", "Jayson Tatum", "Shai Gilgeous-Alexander", "Anthony Edwards",
+        "Kevin Durant", "Anthony Davis", "Kyrie Irving", "Donovan Mitchell", "Jalen Brunson"
     ]
-    
-    x_next = d.iloc[[-1]][features]
-    X = fit_df[features].reset_index(drop=True)
-    y = fit_df["Y"].reset_index(drop=True)
-    ym = fit_df["MIN"].reset_index(drop=True)
-    n = len(y)
-    
-    peso_base = 0.55 ** ((n - 1 - np.arange(n)) / VIDA_MEDIA)
-    w = peso_base
 
-    m_min = HistGradientBoostingRegressor(loss="squared_error", max_depth=3, learning_rate=0.04, random_state=SEED)
-    m_min.fit(X, ym, sample_weight=w)
-    min_pred = float(minutos_override) if minutos_override else float(m_min.predict(x_next)[0])
-    
-    X2 = X.copy()
-    X2["MIN_PRED"] = m_min.predict(X)
-    x2_next = x_next.copy()
-    x2_next["MIN_PRED"] = min_pred
+equipos_dict = obtener_diccionario_equipos()
+nombres_equipos = list(equipos_dict.keys())
+lista_jugadores_global = obtener_lista_completa_jugadores()
 
-    obj_xgb = "count:poisson" if metrica in ["AST", "REB", "STL", "BLK"] else "reg:tweedie"
-    
-    m_xgb = XGBRegressor(
-        n_estimators=120, learning_rate=0.03, max_depth=3, subsample=0.8,
-        colsample_bytree=0.8, reg_lambda=4.0, objective=obj_xgb, random_state=SEED, n_jobs=-1
-    ).fit(X2, y, sample_weight=w)
-    
-    m_hgb = HistGradientBoostingRegressor(
-        loss="poisson" if metrica in ["AST","REB","STL","BLK"] else "squared_error", 
-        max_depth=3, learning_rate=0.04, random_state=SEED
-    ).fit(X2, y, sample_weight=w)
-    
-    m_ridge = Ridge(alpha=12.0).fit(SimpleImputer(strategy="median").fit_transform(X2), y)
+st.markdown(
+    """
+    <div class="hero-box">
+        <div class="hero-title">NBAMetrics Pro</div>
+        <p style="font-size: 14px; color: #94a3b8; margin-top: 6px; margin-bottom: 0;">
+            Motor cuantitativo de proyección individual multimétrica
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-    preds_xgb = m_xgb.predict(X2)
-    preds_hgb = m_hgb.predict(X2)
-    preds_lin = m_ridge.predict(SimpleImputer(strategy="median").fit_transform(X2))
-    
-    A = np.column_stack([preds_xgb, preds_hgb, preds_lin])
-    pesos, _ = nnls(A, y.to_numpy())
-    pesos = pesos / pesos.sum() if pesos.sum() > 0 else np.array([0.4, 0.4, 0.2])
-    
-    nx_imp = SimpleImputer(strategy="median").fit(X2).transform(x2_next)
-    mu = float(np.clip(pesos @ np.array([m_xgb.predict(x2_next)[0], m_hgb.predict(x2_next)[0], m_ridge.predict(nx_imp)[0]]), 0, None))
+st.markdown('<div class="nba-card">', unsafe_allow_html=True)
+st.subheader(" Configuración del Partido y Mercado")
 
-    oof_ens = A @ pesos
-    residuos = y.to_numpy() - oof_ens
-    if len(residuos) == 0: residuos = np.array([0.0])
-    
-    sim = np.maximum(0, np.round(mu + rng.choice(residuos, size=3000, replace=True)))
-    p_boot = float(np.mean(sim > linea))
-    
-    resultado = {
-        "jugador": datos["nombre"], "metrica": metrica, "linea": linea,
-        "proyeccion_modelo": round(mu, 2),
-        "minutos_proyectados": round(min_pred, 1),
-        "probabilidad_over": round(p_boot, 4),
-        "pesos_ensamble": dict(zip(["XGBoost", "HistGBM", "Lineal"], np.round(pesos, 2))),
-        "escenarios": {"mal_juego_P15": float(np.percentile(sim, 15)), "techo_P85": float(np.percentile(sim, 85))}
-    }
-    
-    if cuota_over:
-        resultado["analisis_apuesta"] = evaluar_apuesta(p_boot, cuota_over, cuota_under, len(y))
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    idx_lebron = lista_jugadores_global.index("LeBron James") if "LeBron James" in lista_jugadores_global else 0
+    jugador = st.selectbox(
+        "1. Jugador a analizar (Escribe para buscar)",
+        options=lista_jugadores_global,
+        index=idx_lebron,
+        key="sel_jugador_global"
+    )
+
+with col2:
+    idx_gsw = nombres_equipos.index("Golden State Warriors") if "Golden State Warriors" in nombres_equipos else 0
+    equipo_rival_nombre = st.selectbox("2. Equipo Rival", nombres_equipos, index=idx_gsw, key="sel_equipo_rival")
+    rival_abrev = equipos_dict[equipo_rival_nombre]['abbrev']
+
+with col3:
+    local = st.checkbox("Juega de Local", value=True)
+    playoffs = st.checkbox("Es Partido de Playoffs", value=False)
+
+with st.expander(" Parámetros Avanzados y Cuotas de Mercado (Opcional)", expanded=False):
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        spread = st.number_input("Handicap / Spread (Favorito -4.5)", value=0.0, step=0.5)
+        minutos_override = st.number_input("Minutos Proyectados (0 = Automático)", value=0.0, step=1.0)
+    with col_b:
+        cuota_over = st.number_input("Cuota Over Decimal (Ej. 1.90)", value=0.0, step=0.05)
+    with col_c:
+        cuota_under = st.number_input("Cuota Under Decimal (Ej. 1.90)", value=0.0, step=0.05)
+
+ejecutar = st.button("Analizar Todas las Estadísticas", type="primary", use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
+if ejecutar:
+    try:
+        with st.spinner(f"Analizando métricas e historial de {jugador} vs {rival_abrev}..."):
+            datos = cargar_datos(jugador, ["2025-26", "2026-27"], incluir_playoffs=playoffs)
+            
+            metricas_lista = [
+                ("PTS", "Puntos", 24.5),
+                ("REB", "Rebotes", 7.5),
+                ("AST", "Asistencias", 7.5),
+                ("PRA", "Puntos + Rebotes + Asistencias", 39.5),
+                ("PR", "Puntos + Rebotes", 31.5),
+                ("PA", "Puntos + Asistencias", 31.5),
+                ("RA", "Rebotes + Asistencias", 14.5),
+                ("FG3M", "Triples Anotados", 2.5),
+                ("STL", "Robos", 1.5),
+                ("BLK", "Tapones", 0.5)
+            ]
+            
+            resultados = []
+            
+            for codigo_m, nombre_m, linea_def in metricas_lista:
+                res = analizar(
+                    datos=datos,
+                    metrica=codigo_m,
+                    linea=linea_def,
+                    rival=rival_abrev,
+                    local=local,
+                    playoffs=playoffs,
+                    minutos_override=minutos_override if minutos_override > 0 else None,
+                    spread=spread if spread != 0.0 else None,
+                    cuota_over=cuota_over if cuota_over > 0 else None,
+                    cuota_under=cuota_under if cuota_under > 0 else None
+                )
+                res["nombre_largo"] = nombre_m
+                resultados.append(res)
+
+        st.markdown('<div class="nba-card">', unsafe_allow_html=True)
         
-    return resultado
+        st.markdown(
+            f"""
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3 style="margin: 0;">Reporte Integral: {jugador} vs {equipo_rival_nombre} ({rival_abrev})</h3>
+                <span class="pill-badge pill-blue">Minutos proyectados: {resultados[0]['minutos_proyectados']} min</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        tabla_resumen = []
+        for r in resultados:
+            fila = {
+                "Estadística": r["nombre_largo"],
+                "Código": r["metrica"],
+                "Proyección": r["proyeccion_modelo"],
+                "Piso (P15)": r["escenarios"]["mal_juego_P15"],
+                "Techo (P85)": r["escenarios"]["techo_P85"]
+            }
+            if "analisis_apuesta" in r:
+                fila["Recomendación"] = f"{r['analisis_apuesta']['lado']} (EV: {r['analisis_apuesta']['EV']*100:.1f}%)"
+            tabla_resumen.append(fila)
+            
+        df_tabla = pd.DataFrame(tabla_resumen)
+        st.dataframe(df_tabla, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader(" Desglose Detallado por Categoría")
+
+        cols = st.columns(3)
+        for idx, r in enumerate(resultados):
+            with cols[idx % 3]:
+                extra_html = ""
+                if "analisis_apuesta" in r:
+                    ap = r["analisis_apuesta"]
+                    color_rec = "#34d399" if ap["recomendacion"] == "APOSTAR" else "#94a3b8"
+                    extra_html = f"<div style='font-size: 0.78rem; color: {color_rec}; margin-top: 4px;'>Apuesta: <b>{ap['lado']}</b> (EV: {ap['EV']*100:.1f}%)</div>"
+
+                st.markdown(
+                    f"""
+                    <div style="background-color: #070a12; border: 1px solid #1e293b; border-radius: 10px; padding: 14px; margin-bottom: 14px;">
+                        <div style="font-size: 0.85rem; color: #94a3b8; font-weight: 600;">{r['nombre_largo']} ({r['metrica']})</div>
+                        <div style="font-family: 'Oswald', sans-serif; font-size: 2.2rem; font-weight: 700; color: #f8fafc; margin: 4px 0;">{r['proyeccion_modelo']}</div>
+                        <div style="font-size: 0.8rem; color: #64748b;">Rango estocástico: {r['escenarios']['mal_juego_P15']} a {r['escenarios']['techo_P85']}</div>
+                        {extra_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    except Exception as e:
+        st.error(f"Error durante el procesamiento: {e}")
